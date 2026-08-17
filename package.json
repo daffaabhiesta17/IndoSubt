@@ -1,0 +1,31 @@
+{
+  "name": "indo-sync-phase-1",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Minimal Stremio subtitle add-on protocol prototype for IndoSync.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "dev": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "npm run typecheck && npm run test",
+    "vercel-build": "npm run typecheck"
+  },
+  "dependencies": {
+    "express": "^5.1.0",
+    "stremio-addon-sdk": "^1.6.10"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.3",
+    "@types/node": "^22.15.3",
+    "@types/supertest": "^6.0.2",
+    "@vercel/node": "^5.3.8",
+    "supertest": "^7.1.0",
+    "tsx": "^4.19.4",
+    "typescript": "^5.8.3",
+    "vitest": "^3.1.3"
+  }
+}

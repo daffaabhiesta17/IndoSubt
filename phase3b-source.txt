@@ -1,0 +1,1508 @@
+﻿
+===== FILE: src/subtitles/service.ts =====
+
+import { createHmac, timingSafeEqual } from 'node:crypto';
+import { ProviderError, type SubtitleProvider } from './provider.js';
+import {
+  DeterministicSubtitleCandidateRanker,
+  type SubtitleCandidateRanker
+} from './ranker.js';
+import { parseStremioSubtitleRequest } from './stremio-id.js';
+import type {
+  DownloadedSubtitle,
+  SubtitleRequestContext,
+  SubtitleRequestMetadata,
+  SubtitleResponse
+} from './types.js';
+
+export interface SubtitleService {
+  search(
+    type: string,
+    id: string,
+    origin: string,
+    metadata?: SubtitleRequestMetadata
+  ): Promise<SubtitleResponse>;
+  download(reference: string): Promise<DownloadedSubtitle>;
+}
+
+export class ProviderSubtitleService implements SubtitleService {
+  constructor(
+    private readonly provider: SubtitleProvider,
+    private readonly referenceSecret: string,
+    private readonly logger: Pick<Console, 'warn'> = console,
+    private readonly ranker: SubtitleCandidateRanker = new DeterministicSubtitleCandidateRanker()
+  ) {
+    if (!referenceSecret) throw new Error('A reference signing secret is required.');
+  }
+
+  async search(
+    type: string,
+    id: string,
+    origin: string,
+    metadata: SubtitleRequestMetadata = {}
+  ): Promise<SubtitleResponse> {
+    const media = parseStremioSubtitleRequest(type, id);
+    if (!media) return { subtitles: [] };
+
+    const context: SubtitleRequestContext = { media, metadata };
+    try {
+      const candidates = await this.provider.search(media);
+      const rankedCandidates = this.ranker.rank(candidates, context);
+      return {
+        subtitles: rankedCandidates.slice(0, 5).map((candidate) => {
+          const publicReference = this.signReference(candidate.reference);
+          return {
+            id: `${candidate.provider}-${candidate.reference}`,
+            url: `${origin}/subtitles/provider/${encodeURIComponent(publicReference)}.vtt`,
+            lang: 'ind'
+          };
+        })
+      };
+    } catch (error) {
+      const code = error instanceof ProviderError ? error.code : 'unavailable';
+      this.logger.warn(`[IndoSync] Subtitle provider search failed (${code}).`);
+      return { subtitles: [] };
+    }
+  }
+
+  download(publicReference: string): Promise<DownloadedSubtitle> {
+    const reference = this.verifyReference(publicReference);
+    return this.provider.download(reference);
+  }
+
+  private signReference(reference: string): string {
+    return `${reference}.${this.signature(reference)}`;
+  }
+
+  private verifyReference(publicReference: string): string {
+    const separator = publicReference.lastIndexOf('.');
+    if (separator < 1) throw new ProviderError('not_found', 'Invalid subtitle reference.');
+
+    const reference = publicReference.slice(0, separator);
+    const received = publicReference.slice(separator + 1);
+    const expected = this.signature(reference);
+    const receivedBytes = Buffer.from(received);
+    const expectedBytes = Buffer.from(expected);
+    if (
+      receivedBytes.length !== expectedBytes.length ||
+      !timingSafeEqual(receivedBytes, expectedBytes)
+    ) {
+      throw new ProviderError('not_found', 'Invalid subtitle reference.');
+    }
+    return reference;
+  }
+
+  private signature(reference: string): string {
+    return createHmac('sha256', this.referenceSecret)
+      .update(`${this.provider.name}:${reference}`)
+      .digest('base64url')
+      .slice(0, 22);
+  }
+}
+
+export class FixtureSubtitleService implements SubtitleService {
+  async search(type: string, id: string, origin: string): Promise<SubtitleResponse> {
+    if (!parseStremioSubtitleRequest(type, id)) return { subtitles: [] };
+    return {
+      subtitles: [
+        {
+          id: 'indosync-static-indonesian-v1',
+          url: `${origin}/subtitles/indosync-id.vtt`,
+          lang: 'ind'
+        }
+      ]
+    };
+  }
+
+  async download(): Promise<DownloadedSubtitle> {
+    throw new ProviderError('missing_configuration', 'A subtitle provider is not configured.');
+  }
+}
+
+
+===== FILE: src/subtitles/provider.ts =====
+
+import type { DownloadedSubtitle, SubtitleCandidate, SubtitleSearchRequest } from './types.js';
+
+export interface SubtitleProvider {
+  readonly name: string;
+  search(request: SubtitleSearchRequest): Promise<SubtitleCandidate[]>;
+  download(reference: string): Promise<DownloadedSubtitle>;
+}
+
+export type ProviderErrorCode =
+  | 'missing_configuration'
+  | 'unauthorized'
+  | 'not_found'
+  | 'rate_limited'
+  | 'timeout'
+  | 'unavailable'
+  | 'malformed_response'
+  | 'invalid_subtitle';
+
+export class ProviderError extends Error {
+  constructor(
+    public readonly code: ProviderErrorCode,
+    message: string,
+    public readonly retryAfterSeconds?: number
+  ) {
+    super(message);
+    this.name = 'ProviderError';
+  }
+}
+
+
+===== FILE: src/subtitles/providers/opensubtitles.ts =====
+
+import { ProviderError, type SubtitleProvider } from '../provider.js';
+import { openSubtitlesImdbId } from '../stremio-id.js';
+import type { DownloadedSubtitle, SubtitleCandidate, SubtitleSearchRequest } from '../types.js';
+import { validateWebVtt } from '../webvtt.js';
+
+const defaultBaseUrl = 'https://api.opensubtitles.com/api/v1';
+const defaultTimeoutMs = 5_000;
+const defaultMaxSubtitleBytes = 5 * 1024 * 1024;
+
+interface OpenSubtitlesProviderOptions {
+  apiKey: string;
+  userAgent?: string;
+  fetchImplementation?: typeof fetch;
+  baseUrl?: string;
+  timeoutMs?: number;
+  maxSubtitleBytes?: number;
+}
+
+interface SearchFeatureDetails {
+  season_number?: unknown;
+  episode_number?: unknown;
+}
+
+interface SearchAttributes {
+  language?: unknown;
+  feature_details?: SearchFeatureDetails;
+  files?: unknown;
+}
+
+interface SearchItem {
+  attributes?: SearchAttributes;
+}
+
+interface DownloadResponse {
+  link?: unknown;
+  file_name?: unknown;
+}
+
+function retryAfter(response: Response): number | undefined {
+  const value = response.headers.get('retry-after');
+  if (!value) return undefined;
+  const seconds = Number(value);
+  return Number.isFinite(seconds) && seconds >= 0 ? seconds : undefined;
+}
+
+function statusError(response: Response): ProviderError {
+  if (response.status === 401 || response.status === 403) {
+    return new ProviderError('unauthorized', 'OpenSubtitles rejected the configured credentials.');
+  }
+  if (response.status === 404) {
+    return new ProviderError('not_found', 'OpenSubtitles resource was not found.');
+  }
+  if (response.status === 429) {
+    return new ProviderError(
+      'rate_limited',
+      'OpenSubtitles rate limit was reached.',
+      retryAfter(response)
+    );
+  }
+  return new ProviderError('unavailable', `OpenSubtitles returned HTTP ${response.status}.`);
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof Error && error.name === 'AbortError';
+}
+
+export class OpenSubtitlesProvider implements SubtitleProvider {
+  readonly name = 'opensubtitles';
+  private readonly apiKey: string;
+  private readonly userAgent: string;
+  private readonly fetchImplementation: typeof fetch;
+  private readonly baseUrl: string;
+  private readonly timeoutMs: number;
+  private readonly maxSubtitleBytes: number;
+
+  constructor(options: OpenSubtitlesProviderOptions) {
+    if (!options.apiKey.trim()) {
+      throw new ProviderError('missing_configuration', 'OpenSubtitles API key is not configured.');
+    }
+
+    this.apiKey = options.apiKey;
+    this.userAgent = options.userAgent?.trim() || 'IndoSync/0.1.0';
+    this.fetchImplementation = options.fetchImplementation ?? fetch;
+    this.baseUrl = options.baseUrl ?? defaultBaseUrl;
+    this.timeoutMs = options.timeoutMs ?? defaultTimeoutMs;
+    this.maxSubtitleBytes = options.maxSubtitleBytes ?? defaultMaxSubtitleBytes;
+  }
+
+  async search(request: SubtitleSearchRequest): Promise<SubtitleCandidate[]> {
+    const url = new URL(`${this.baseUrl}/subtitles`);
+    url.searchParams.set('imdb_id', openSubtitlesImdbId(request.imdbId));
+    url.searchParams.set('languages', 'id');
+    if (request.type === 'series') {
+      url.searchParams.set('season_number', String(request.season));
+      url.searchParams.set('episode_number', String(request.episode));
+    }
+
+    const response = await this.request(url, {
+      method: 'GET',
+      headers: this.apiHeaders()
+    });
+    if (!response.ok) throw statusError(response);
+
+    const payload = await this.readJson(response);
+    if (!isRecord(payload) || !Array.isArray(payload.data)) {
+      throw new ProviderError('malformed_response', 'OpenSubtitles search response is malformed.');
+    }
+
+    const candidates: SubtitleCandidate[] = [];
+    for (const rawItem of payload.data) {
+      const item = rawItem as SearchItem;
+      const attributes = item?.attributes;
+      if (!attributes || attributes.language !== 'id' || !Array.isArray(attributes.files)) continue;
+
+      if (request.type === 'series') {
+        const details = attributes.feature_details;
+        if (
+          Number(details?.season_number) !== request.season ||
+          Number(details?.episode_number) !== request.episode
+        ) {
+          continue;
+        }
+      }
+
+      for (const rawFile of attributes.files) {
+        if (!isRecord(rawFile)) continue;
+        const fileId = rawFile.file_id;
+        const fileName = rawFile.file_name;
+        if (!Number.isSafeInteger(fileId) || Number(fileId) <= 0 || typeof fileName !== 'string') continue;
+
+        candidates.push({
+          provider: this.name,
+          reference: String(fileId),
+          language: 'id',
+          fileName,
+          format: fileName.split('.').pop()?.toLowerCase()
+        });
+      }
+    }
+
+    return candidates;
+  }
+
+  async download(reference: string): Promise<DownloadedSubtitle> {
+    if (!/^[1-9]\d*$/.test(reference)) {
+      throw new ProviderError('not_found', 'Invalid OpenSubtitles file reference.');
+    }
+
+    const response = await this.request(`${this.baseUrl}/download`, {
+      method: 'POST',
+      headers: { ...this.apiHeaders(), 'Content-Type': 'application/json' },
+      body: JSON.stringify({ file_id: Number(reference), sub_format: 'webvtt' })
+    });
+    if (!response.ok) throw statusError(response);
+
+    const payload = (await this.readJson(response)) as DownloadResponse;
+    if (!isRecord(payload) || typeof payload.link !== 'string') {
+      throw new ProviderError('malformed_response', 'OpenSubtitles download response is malformed.');
+    }
+
+    const downloadUrl = new URL(payload.link);
+    if (
+      downloadUrl.protocol !== 'https:' ||
+      !(downloadUrl.hostname === 'opensubtitles.com' || downloadUrl.hostname.endsWith('.opensubtitles.com'))
+    ) {
+      throw new ProviderError('malformed_response', 'OpenSubtitles returned an untrusted download URL.');
+    }
+
+    // Temporary links are fetched server-side so the consumer key is never exposed to Stremio.
+    const subtitleResponse = await this.request(downloadUrl, {
+      method: 'GET',
+      headers: { 'User-Agent': this.userAgent }
+    });
+    if (!subtitleResponse.ok) throw statusError(subtitleResponse);
+
+    const declaredLength = Number(subtitleResponse.headers.get('content-length'));
+    if (Number.isFinite(declaredLength) && declaredLength > this.maxSubtitleBytes) {
+      throw new ProviderError('invalid_subtitle', 'Subtitle file exceeds the allowed size.');
+    }
+
+    const bytes = await subtitleResponse.arrayBuffer();
+    if (bytes.byteLength > this.maxSubtitleBytes) {
+      throw new ProviderError('invalid_subtitle', 'Subtitle file exceeds the allowed size.');
+    }
+
+    try {
+      return {
+        content: validateWebVtt(new TextDecoder().decode(bytes)),
+        contentType: 'text/vtt; charset=utf-8',
+        fileName: typeof payload.file_name === 'string' ? payload.file_name : undefined
+      };
+    } catch {
+      throw new ProviderError('invalid_subtitle', 'OpenSubtitles did not return valid WebVTT.');
+    }
+  }
+
+  private apiHeaders(): Record<string, string> {
+    return { 'Api-Key': this.apiKey, 'User-Agent': this.userAgent };
+  }
+
+  private async request(input: string | URL, init: RequestInit): Promise<Response> {
+    try {
+      return await this.fetchImplementation(input, {
+        ...init,
+        signal: AbortSignal.timeout(this.timeoutMs)
+      });
+    } catch (error) {
+      if (isAbortError(error) || (error instanceof Error && error.name === 'TimeoutError')) {
+        throw new ProviderError('timeout', 'OpenSubtitles request timed out.');
+      }
+      throw new ProviderError('unavailable', 'OpenSubtitles request failed.');
+    }
+  }
+
+  private async readJson(response: Response): Promise<unknown> {
+    try {
+      return await response.json();
+    } catch {
+      throw new ProviderError('malformed_response', 'OpenSubtitles returned malformed JSON.');
+    }
+  }
+}
+
+function isRecord(value: unknown): value is Record<string, any> {
+  return typeof value === 'object' && value !== null;
+}
+
+
+===== FILE: src/app.ts =====
+
+import express, { type Request } from 'express';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { createAddon } from './addon.js';
+import { ProviderError } from './subtitles/provider.js';
+import { OpenSubtitlesProvider } from './subtitles/providers/opensubtitles.js';
+import {
+  FixtureSubtitleService,
+  ProviderSubtitleService,
+  type SubtitleService
+} from './subtitles/service.js';
+
+const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
+const publicDirectory = path.resolve(currentDirectory, '../public');
+const maxExtraLength = 4_096;
+const maxExtraFields = 16;
+const maxExtraFieldLength = 1_024;
+
+function requestOrigin(request: Request): string {
+  const protocol = request.header('x-forwarded-proto') ?? request.protocol;
+  const host = request.header('x-forwarded-host') ?? request.header('host');
+
+  if (!host) {
+    throw new Error('Host header is required to build subtitle URL.');
+  }
+
+  return `${protocol}://${host}`;
+}
+
+function firstParameter(value: string | string[] | undefined): string | undefined {
+  return Array.isArray(value) ? value[0] : value;
+}
+
+function subtitleExtra(request: express.Request): Record<string, string> {
+  const extra: Record<string, string> = {};
+  const pathExtra = firstParameter(request.params.extra);
+
+  if (pathExtra && pathExtra.length <= maxExtraLength) {
+    let fields = 0;
+    for (const [key, value] of new URLSearchParams(pathExtra)) {
+      if (fields >= maxExtraFields) break;
+      if (!key || key.length > maxExtraFieldLength) continue;
+      extra[key] = value.slice(0, maxExtraFieldLength);
+      fields += 1;
+    }
+  }
+
+  const filename = request.query.filename;
+  if (typeof filename === 'string') {
+    extra.filename = filename.slice(0, maxExtraFieldLength);
+  }
+
+  return extra;
+}
+
+function serviceFromEnvironment(): SubtitleService {
+  const apiKey = process.env.OPENSUBTITLES_API_KEY?.trim();
+  if (!apiKey) {
+    return new FixtureSubtitleService();
+  }
+
+  return new ProviderSubtitleService(
+    new OpenSubtitlesProvider({
+      apiKey,
+      userAgent: process.env.OPENSUBTITLES_USER_AGENT ?? 'IndoSync/0.1.0'
+    }),
+    apiKey
+  );
+}
+
+export function createApp(subtitleService: SubtitleService = serviceFromEnvironment()) {
+  const app = express();
+
+  app.use((request, response, next) => {
+    response.setHeader('Access-Control-Allow-Origin', '*');
+    response.setHeader('Access-Control-Allow-Methods', 'GET, OPTIONS');
+
+    if (request.method === 'OPTIONS') {
+      response.status(204).end();
+      return;
+    }
+
+    next();
+  });
+
+  app.use(express.static(publicDirectory));
+
+  app.get('/manifest.json', (request, response) => {
+    const addon = createAddon(requestOrigin(request), subtitleService);
+    response.json(addon.manifest);
+  });
+
+  const handleSubtitleRequest = async (
+    request: express.Request,
+    response: express.Response,
+    next: express.NextFunction
+  ) => {
+    try {
+      const addon = createAddon(requestOrigin(request), subtitleService);
+      // Stremio extras are bounded metadata only. They are never interpreted
+      // as paths, URLs, provider file IDs, or signed download references.
+      const extra = subtitleExtra(request);
+      const type = firstParameter(request.params.type) ?? '';
+      const id = firstParameter(request.params.id) ?? '';
+      const result = await addon.get('subtitles', type, id, extra);
+      response.json(result);
+    } catch (error) {
+      next(error);
+    }
+  };
+
+  app.get('/subtitles/:type/:id.json', handleSubtitleRequest);
+
+  app.get('/subtitles/provider/:reference.vtt', async (request, response) => {
+    try {
+      const subtitle = await subtitleService.download(request.params.reference);
+      response.type(subtitle.contentType).send(subtitle.content);
+    } catch (error) {
+      const providerError = error instanceof ProviderError ? error : undefined;
+      if (providerError?.retryAfterSeconds !== undefined) {
+        response.setHeader('Retry-After', String(providerError.retryAfterSeconds));
+      }
+
+      const status =
+        providerError?.code === 'not_found' || providerError?.code === 'invalid_subtitle'
+          ? 404
+          : providerError?.code === 'rate_limited'
+            ? 429
+            : providerError?.code === 'timeout'
+              ? 504
+              : 502;
+      response.status(status).json({ error: 'Subtitle is temporarily unavailable.' });
+    }
+  });
+
+  // Some Stremio clients omit `.json` and may serialize subtitle extras as
+  // one query-string-shaped path segment. Keep these aliases after the signed
+  // provider route so they cannot shadow or broaden subtitle file access.
+  app.get('/subtitles/:type/:id/:extra', handleSubtitleRequest);
+  app.get('/subtitles/:type/:id', handleSubtitleRequest);
+
+  return app;
+}
+
+export const app = createApp();
+
+// Vercel's Express preset discovers src/app.ts and requires the Express app
+// itself to be the module's default export.
+export default app;
+
+
+===== FILE: src/subtitles/types.ts =====
+
+export type SubtitleSearchRequest =
+  | { type: 'movie'; imdbId: string }
+  | { type: 'series'; imdbId: string; season: number; episode: number };
+
+export interface SubtitleRequestMetadata {
+  filename?: string;
+  videoSize?: string;
+}
+
+export interface SubtitleRequestContext {
+  media: SubtitleSearchRequest;
+  metadata: SubtitleRequestMetadata;
+}
+
+export interface SubtitleCandidate {
+  provider: string;
+  reference: string;
+  language: 'id';
+  fileName: string;
+  format?: string;
+}
+
+export interface DownloadedSubtitle {
+  content: string;
+  contentType: 'text/vtt; charset=utf-8';
+  fileName?: string;
+}
+
+export interface StremioSubtitle {
+  id: string;
+  url: string;
+  lang: 'ind';
+}
+
+export interface SubtitleResponse {
+  subtitles: StremioSubtitle[];
+}
+
+
+===== FILE: src/subtitles/webvtt.ts =====
+
+export function validateWebVtt(content: string): string {
+  const withoutBom = content.replace(/^\uFEFF/, '');
+  if (!/^WEBVTT(?:[ \t].*)?(?:\r?\n|$)/.test(withoutBom)) {
+    throw new Error('Subtitle content is not valid WebVTT.');
+  }
+  return withoutBom;
+}
+
+export interface WebVttTimestampMapping {
+  scale?: number;
+  offsetMs?: number;
+}
+
+interface DocumentBlock {
+  block: string;
+  followingSeparator: string;
+}
+
+interface BlockLine {
+  text: string;
+  start: number;
+  end: number;
+}
+
+interface TimestampStyle {
+  short: boolean;
+  hourWidth: number;
+}
+
+interface ParsedTimestamp {
+  milliseconds: number;
+  style: TimestampStyle;
+}
+
+interface CueTimingLine {
+  prefix: string;
+  separator: string;
+  suffix: string;
+  start: ParsedTimestamp;
+  end: ParsedTimestamp;
+}
+
+const timestampSource =
+  '(?:\\d{2,}:[0-5]\\d:[0-5]\\d\\.\\d{3}|[0-5]\\d:[0-5]\\d\\.\\d{3})';
+
+const timingLinePattern = new RegExp(
+  `^(\\s*)(${timestampSource})([ \\t]+-->[ \\t]+)(${timestampSource})(.*)$`
+);
+
+const maximumSafeTimestamp = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * Applies a known linear mapping to WebVTT cue timestamps.
+ *
+ * outputMs = round(inputMs * scale + offsetMs)
+ *
+ * This function does not discover or calculate synchronization parameters.
+ */
+export function transformWebVtt(
+  content: string,
+  mapping: WebVttTimestampMapping = {}
+): string {
+  const validated = validateWebVtt(content);
+  const scale = mapping.scale ?? 1;
+  const offsetMs = mapping.offsetMs ?? 0;
+
+  validateMapping(scale, offsetMs);
+
+  // Preserve the original timestamp representation and document structure
+  // when no transformation is requested. BOM behavior remains identical to
+  // validateWebVtt(): an initial BOM is removed.
+  if (scale === 1 && offsetMs === 0) {
+    return validated;
+  }
+
+  const blocks = splitDocumentBlocks(validated);
+  if (blocks.length === 0) return validated;
+
+  let output = blocks[0].block + blocks[0].followingSeparator;
+
+  for (let index = 1; index < blocks.length; index += 1) {
+    const entry = blocks[index];
+    const transformed = transformCueBlock(
+      entry.block,
+      scale,
+      offsetMs
+    );
+
+    // Dropping a cue also drops the separator that originally followed it.
+    // The separator before it belongs to the preceding retained block.
+    if (transformed === undefined) continue;
+
+    output += transformed + entry.followingSeparator;
+  }
+
+  return output;
+}
+
+function validateMapping(scale: number, offsetMs: number): void {
+  if (!Number.isFinite(scale) || scale <= 0) {
+    throw new Error(
+      'WebVTT timestamp scale must be finite and greater than zero.'
+    );
+  }
+
+  if (!Number.isFinite(offsetMs)) {
+    throw new Error('WebVTT timestamp offset must be finite.');
+  }
+}
+
+function transformCueBlock(
+  block: string,
+  scale: number,
+  offsetMs: number
+): string | undefined {
+  const lines = readBlockLines(block);
+
+  if (lines.length === 0) {
+    throw new Error('WebVTT block is empty.');
+  }
+
+  if (isSpecialBlock(lines[0].text)) {
+    return block;
+  }
+
+  const timingLineIndex = findTimingLineIndex(lines);
+  const timingLine = lines[timingLineIndex];
+  const timing = parseTimingLine(timingLine.text);
+
+  if (!timing) {
+    throw new Error(
+      'WebVTT cue timing line contains a malformed timestamp.'
+    );
+  }
+
+  if (timing.start.milliseconds >= timing.end.milliseconds) {
+    throw new Error(
+      'WebVTT cue end timestamp must be greater than its start timestamp.'
+    );
+  }
+
+  let transformedStart = transformTimestamp(
+    timing.start.milliseconds,
+    scale,
+    offsetMs
+  );
+
+  const transformedEnd = transformTimestamp(
+    timing.end.milliseconds,
+    scale,
+    offsetMs
+  );
+
+  if (transformedEnd <= 0) {
+    return undefined;
+  }
+
+  if (transformedStart < 0) {
+    transformedStart = 0;
+  }
+
+  if (transformedEnd <= transformedStart) {
+    return undefined;
+  }
+
+  const transformedTimingLine =
+    timing.prefix +
+    formatTimestamp(transformedStart, timing.start.style) +
+    timing.separator +
+    formatTimestamp(transformedEnd, timing.end.style) +
+    timing.suffix;
+
+  return (
+    block.slice(0, timingLine.start) +
+    transformedTimingLine +
+    block.slice(timingLine.end)
+  );
+}
+
+function isSpecialBlock(firstLine: string): boolean {
+  const normalized = firstLine.trimStart();
+
+  return /^(?:NOTE(?:[ \t]|$)|STYLE(?:[ \t]|$)|REGION(?:[ \t]|$))/.test(
+    normalized
+  );
+}
+
+function findTimingLineIndex(lines: readonly BlockLine[]): number {
+  const firstLine = lines[0];
+
+  if (timingLinePattern.test(firstLine.text)) {
+    return 0;
+  }
+
+  if (firstLine.text.includes('-->')) {
+    throw new Error(
+      'WebVTT cue timing line contains a malformed timestamp.'
+    );
+  }
+
+  if (looksLikeTimingWithoutArrow(firstLine.text)) {
+    throw new Error('WebVTT cue timing line was not found.');
+  }
+
+  const secondLine = lines[1];
+
+  if (!secondLine) {
+    throw new Error('WebVTT cue timing line was not found.');
+  }
+
+  if (timingLinePattern.test(secondLine.text)) {
+    return 1;
+  }
+
+  if (secondLine.text.includes('-->')) {
+    throw new Error(
+      'WebVTT cue timing line contains a malformed timestamp.'
+    );
+  }
+
+  throw new Error(
+    'WebVTT cue identifier is not followed by a valid timing line.'
+  );
+}
+
+function looksLikeTimingWithoutArrow(line: string): boolean {
+  return /\d{2,}:\S+[ \t]+\d{2,}:\S+/.test(line);
+}
+
+function parseTimingLine(line: string): CueTimingLine | undefined {
+  const match = timingLinePattern.exec(line);
+
+  if (!match) return undefined;
+
+  return {
+    prefix: match[1],
+    start: parseTimestamp(match[2]),
+    separator: match[3],
+    end: parseTimestamp(match[4]),
+    suffix: match[5]
+  };
+}
+
+function parseTimestamp(timestamp: string): ParsedTimestamp {
+  const components = timestamp.split(':');
+  const short = components.length === 2;
+
+  if (!short && components.length !== 3) {
+    throw new Error(
+      'WebVTT cue timing line contains a malformed timestamp.'
+    );
+  }
+
+  const hoursText = short ? '0' : components[0];
+  const minutesText = short ? components[0] : components[1];
+  const secondsAndMilliseconds = short
+    ? components[1]
+    : components[2];
+
+  const secondsMatch = /^(\d{2})\.(\d{3})$/.exec(
+    secondsAndMilliseconds
+  );
+
+  if (!secondsMatch) {
+    throw new Error(
+      'WebVTT cue timing line contains a malformed timestamp.'
+    );
+  }
+
+  const minutes = Number(minutesText);
+  const seconds = Number(secondsMatch[1]);
+  const milliseconds = Number(secondsMatch[2]);
+
+  if (
+    !/^\d+$/.test(hoursText) ||
+    !/^\d{2}$/.test(minutesText) ||
+    minutes < 0 ||
+    minutes > 59 ||
+    seconds < 0 ||
+    seconds > 59 ||
+    milliseconds < 0 ||
+    milliseconds > 999
+  ) {
+    throw new Error(
+      'WebVTT cue timing line contains a malformed timestamp.'
+    );
+  }
+
+  const hours = BigInt(hoursText);
+
+  const total =
+    hours * 3_600_000n +
+    BigInt(minutes) * 60_000n +
+    BigInt(seconds) * 1_000n +
+    BigInt(milliseconds);
+
+  if (total > maximumSafeTimestamp) {
+    throw new Error(
+      'WebVTT cue timestamp is outside the supported safe integer range.'
+    );
+  }
+
+  return {
+    milliseconds: Number(total),
+    style: {
+      short,
+      hourWidth: short ? 2 : hoursText.length
+    }
+  };
+}
+
+function transformTimestamp(
+  inputMs: number,
+  scale: number,
+  offsetMs: number
+): number {
+  const transformed = Math.round(
+    inputMs * scale + offsetMs
+  );
+
+  if (!Number.isSafeInteger(transformed)) {
+    throw new Error(
+      'Transformed WebVTT timestamp is outside the supported safe integer range.'
+    );
+  }
+
+  return transformed;
+}
+
+function formatTimestamp(
+  timestampMs: number,
+  style: TimestampStyle
+): string {
+  const hours = Math.floor(timestampMs / 3_600_000);
+  const afterHours = timestampMs % 3_600_000;
+  const minutes = Math.floor(afterHours / 60_000);
+  const afterMinutes = afterHours % 60_000;
+  const seconds = Math.floor(afterMinutes / 1_000);
+  const milliseconds = afterMinutes % 1_000;
+
+  const minutePart = String(minutes).padStart(2, '0');
+  const secondPart = String(seconds).padStart(2, '0');
+  const millisecondPart = String(milliseconds).padStart(3, '0');
+
+  if (style.short && hours === 0) {
+    return `${minutePart}:${secondPart}.${millisecondPart}`;
+  }
+
+  const hourWidth = Math.max(2, style.hourWidth);
+  const hourPart = String(hours).padStart(hourWidth, '0');
+
+  return `${hourPart}:${minutePart}:${secondPart}.${millisecondPart}`;
+}
+
+function splitDocumentBlocks(content: string): DocumentBlock[] {
+  const lines = readCompleteLines(content);
+  const blocks: DocumentBlock[] = [];
+
+  let block = '';
+  let separator = '';
+  let readingSeparator = false;
+
+  for (const line of lines) {
+    if (isBlankLine(line)) {
+      if (readingSeparator) {
+        separator += line;
+      } else {
+        readingSeparator = true;
+        separator = line;
+      }
+      continue;
+    }
+
+    if (readingSeparator) {
+      blocks.push({
+        block,
+        followingSeparator: separator
+      });
+
+      block = line;
+      separator = '';
+      readingSeparator = false;
+    } else {
+      block += line;
+    }
+  }
+
+  if (block || separator) {
+    blocks.push({
+      block,
+      followingSeparator: separator
+    });
+  }
+
+  return blocks;
+}
+
+function isBlankLine(completeLine: string): boolean {
+  const text = removeLineEnding(completeLine);
+  return /^[ \t]*$/.test(text);
+}
+
+function readCompleteLines(content: string): string[] {
+  const lines: string[] = [];
+  const linePattern = /[^\r\n]*(?:\r\n|\n|$)/g;
+
+  for (const match of content.matchAll(linePattern)) {
+    if (match[0]) lines.push(match[0]);
+  }
+
+  return lines;
+}
+
+function readBlockLines(block: string): BlockLine[] {
+  const lines: BlockLine[] = [];
+  const linePattern = /[^\r\n]*(?:\r\n|\n|$)/g;
+
+  for (const match of block.matchAll(linePattern)) {
+    const completeLine = match[0];
+
+    if (!completeLine) continue;
+
+    const newlineLength = completeLine.endsWith('\r\n')
+      ? 2
+      : completeLine.endsWith('\n')
+        ? 1
+        : 0;
+
+    const start = match.index;
+    const end =
+      start + completeLine.length - newlineLength;
+
+    lines.push({
+      text: completeLine.slice(
+        0,
+        completeLine.length - newlineLength
+      ),
+      start,
+      end
+    });
+  }
+
+  return lines;
+}
+
+function removeLineEnding(line: string): string {
+  if (line.endsWith('\r\n')) return line.slice(0, -2);
+  if (line.endsWith('\n')) return line.slice(0, -1);
+  return line;
+}
+
+===== FILE: tests/subtitle-service.test.ts =====
+
+import request from 'supertest';
+import { describe, expect, it, vi } from 'vitest';
+import { createApp } from '../src/app.js';
+import { ProviderError, type SubtitleProvider } from '../src/subtitles/provider.js';
+import type { SubtitleCandidateRanker } from '../src/subtitles/ranker.js';
+import { ProviderSubtitleService } from '../src/subtitles/service.js';
+import type {
+  DownloadedSubtitle,
+  SubtitleCandidate,
+  SubtitleRequestContext
+} from '../src/subtitles/types.js';
+
+function mockProvider(overrides: Partial<SubtitleProvider> = {}): SubtitleProvider {
+  return {
+    name: 'opensubtitles',
+    search: vi.fn().mockResolvedValue([]),
+    download: vi.fn().mockResolvedValue({
+      content: 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHalo',
+      contentType: 'text/vtt; charset=utf-8'
+    } satisfies DownloadedSubtitle),
+    ...overrides
+  };
+}
+
+const candidate: SubtitleCandidate = {
+  provider: 'opensubtitles',
+  reference: '42',
+  language: 'id',
+  fileName: 'release.id.srt'
+};
+
+describe('Phase 2A subtitle service and Stremio mapping', () => {
+  it('maps provider candidates to signed IndoSync URLs and lang ind', async () => {
+    const provider = mockProvider({ search: vi.fn().mockResolvedValue([candidate]) });
+    const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
+
+    const response = await request(app).get('/subtitles/movie/tt0133093.json');
+    expect(response.status).toBe(200);
+    expect(response.body.subtitles).toHaveLength(1);
+    expect(response.body.subtitles[0]).toMatchObject({
+      id: 'opensubtitles-42',
+      lang: 'ind'
+    });
+    expect(response.body.subtitles[0].url).toMatch(
+      /^http:\/\/127\.0\.0\.1:\d+\/subtitles\/provider\/42\.[A-Za-z0-9_-]+\.vtt$/
+    );
+    expect(response.body.subtitles[0].url).not.toContain('test-signing-secret');
+  });
+
+  it('supports the Stremio runtime route without .json and with filename metadata', async () => {
+    const search = vi.fn().mockResolvedValue([candidate]);
+    const provider = mockProvider({ search });
+    const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
+
+    const response = await request(app)
+      .get('/subtitles/movie/tt0133093')
+      .query({ filename: 'The.Matrix.1999.1080p.mkv' });
+
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toContain('application/json');
+    expect(response.body.subtitles).toHaveLength(1);
+    expect(response.body.subtitles[0]).toMatchObject({
+      id: 'opensubtitles-42',
+      lang: 'ind'
+    });
+    expect(response.body.subtitles[0].url).toMatch(
+      /^http:\/\/127\.0\.0\.1:\d+\/subtitles\/provider\/42\.[A-Za-z0-9_-]+\.vtt$/
+    );
+    expect(search).toHaveBeenCalledWith({ type: 'movie', imdbId: 'tt0133093' });
+  });
+
+  it('supports series runtime requests and treats filename only as inert metadata', async () => {
+    const search = vi.fn().mockResolvedValue([candidate]);
+    const provider = mockProvider({ search });
+    const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
+
+    const response = await request(app)
+      .get('/subtitles/series/tt0944947:1:3')
+      .query({ filename: '../../provider/999.vtt' });
+
+    expect(response.status).toBe(200);
+    expect(response.body.subtitles[0]).toMatchObject({ lang: 'ind' });
+    expect(search).toHaveBeenCalledWith({
+      type: 'series',
+      imdbId: 'tt0944947',
+      season: 1,
+      episode: 3
+    });
+    expect(provider.download).not.toHaveBeenCalled();
+  });
+  it('supports filename in the Stremio extra path segment', async () => {
+    const search = vi.fn().mockResolvedValue([candidate]);
+    const provider = mockProvider({ search });
+    const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
+
+    const response = await request(app).get(
+      '/subtitles/movie/tt0133093/filename=The.Matrix.1999.mkv'
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toContain('application/json');
+    expect(response.body.subtitles[0]).toMatchObject({
+      id: 'opensubtitles-42',
+      lang: 'ind'
+    });
+    expect(search).toHaveBeenCalledWith({ type: 'movie', imdbId: 'tt0133093' });
+    expect(provider.download).not.toHaveBeenCalled();
+  });
+
+  it('supports videoSize and multiple bounded metadata fields in an extra segment', async () => {
+    const search = vi.fn().mockResolvedValue([candidate]);
+    const provider = mockProvider({ search });
+    const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
+
+    const videoSizeResponse = await request(app).get(
+      '/subtitles/movie/tt0133093/videoSize=1920x1080'
+    );
+    const multipleResponse = await request(app).get(
+      '/subtitles/movie/tt0133093/filename=movie.mkv&videoSize=1920x1080&unknown=value'
+    );
+
+    expect(videoSizeResponse.status).toBe(200);
+    expect(videoSizeResponse.body.subtitles[0]).toMatchObject({ lang: 'ind' });
+    expect(multipleResponse.status).toBe(200);
+    expect(multipleResponse.body.subtitles[0]).toMatchObject({ lang: 'ind' });
+    expect(search).toHaveBeenCalledTimes(2);
+    expect(provider.download).not.toHaveBeenCalled();
+  });
+
+  it('supports series IDs with a filename extra path segment', async () => {
+    const search = vi.fn().mockResolvedValue([candidate]);
+    const provider = mockProvider({ search });
+    const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
+
+    const response = await request(app).get(
+      '/subtitles/series/tt0944947:1:3/filename=episode.mkv'
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.subtitles[0]).toMatchObject({ lang: 'ind' });
+    expect(search).toHaveBeenCalledWith({
+      type: 'series',
+      imdbId: 'tt0944947',
+      season: 1,
+      episode: 3
+    });
+    expect(provider.download).not.toHaveBeenCalled();
+  });
+
+  it('never treats traversal-like extra paths as subtitle file access', async () => {
+    const search = vi.fn().mockResolvedValue([candidate]);
+    const provider = mockProvider({ search });
+    const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
+
+    const response = await request(app).get(
+      '/subtitles/movie/tt0133093/%2E%2E%2F%2E%2E%2Fprovider%2F999.vtt'
+    );
+
+    expect(response.headers['content-type']).not.toContain('text/vtt');
+    expect(response.text).not.toContain('WEBVTT');
+    expect(provider.download).not.toHaveBeenCalled();
+  });
+  it('allow-lists filename/videoSize metadata and ignores unknown extras', async () => {
+    const rank = vi.fn(
+      (candidates: readonly SubtitleCandidate[], context: SubtitleRequestContext) => [...candidates]
+    );
+    const ranker: SubtitleCandidateRanker = { rank };
+    const provider = mockProvider({ search: vi.fn().mockResolvedValue([candidate]) });
+    const app = createApp(
+      new ProviderSubtitleService(provider, 'secret', { warn: vi.fn() }, ranker)
+    );
+
+    const response = await request(app).get(
+      '/subtitles/movie/tt0133093/filename=Movie.1080p.mkv&videoSize=1920x1080&unknown=ignored'
+    );
+
+    expect(response.status).toBe(200);
+    expect(rank).toHaveBeenCalledWith([candidate], {
+      media: { type: 'movie', imdbId: 'tt0133093' },
+      metadata: { filename: 'Movie.1080p.mkv', videoSize: '1920x1080' }
+    });
+  });
+
+  it('calls provider search once, never downloads, and ranks before selecting five', async () => {
+    const candidates = Array.from({ length: 7 }, (_, index) => ({
+      ...candidate,
+      reference: String(index + 1),
+      fileName: `Movie.Release.${index + 1}.srt`
+    }));
+    const search = vi.fn().mockResolvedValue(candidates);
+    const provider = mockProvider({ search });
+    const rank = vi.fn((items: readonly SubtitleCandidate[]) => [
+      items[6],
+      items[5],
+      ...items.slice(0, 5)
+    ]);
+    const app = createApp(
+      new ProviderSubtitleService(provider, 'secret', { warn: vi.fn() }, { rank })
+    );
+
+    const response = await request(app).get(
+      '/subtitles/movie/tt0133093/filename=Movie.Release.7.mkv'
+    );
+
+    expect(search).toHaveBeenCalledTimes(1);
+    expect(rank.mock.calls[0][0]).toHaveLength(7);
+    expect(provider.download).not.toHaveBeenCalled();
+    expect(response.body.subtitles).toHaveLength(5);
+    expect(response.body.subtitles.map((item: { id: string }) => item.id)).toEqual([
+      'opensubtitles-7',
+      'opensubtitles-6',
+      'opensubtitles-1',
+      'opensubtitles-2',
+      'opensubtitles-3'
+    ]);
+    expect(response.body.subtitles.every((item: { lang: string }) => item.lang === 'ind')).toBe(true);
+  });
+
+  it('preserves provider order in service when filename metadata is absent', async () => {
+    const provider = mockProvider({
+      search: vi.fn().mockResolvedValue([
+        { ...candidate, reference: '2', fileName: 'B.srt' },
+        { ...candidate, reference: '1', fileName: 'A.srt' }
+      ])
+    });
+    const app = createApp(new ProviderSubtitleService(provider, 'secret'));
+
+    const response = await request(app).get('/subtitles/movie/tt0133093.json');
+    expect(response.body.subtitles.map((item: { id: string }) => item.id)).toEqual([
+      'opensubtitles-2',
+      'opensubtitles-1'
+    ]);
+  });
+
+  it('keeps fixture fallback behavior with metadata present', async () => {
+    const { FixtureSubtitleService } = await import('../src/subtitles/service.js');
+    const app = createApp(new FixtureSubtitleService());
+    const response = await request(app).get(
+      '/subtitles/movie/tt0133093/filename=Movie.1080p.mkv'
+    );
+
+    expect(response.status).toBe(200);
+    expect(response.body.subtitles[0]).toMatchObject({
+      id: 'indosync-static-indonesian-v1',
+      lang: 'ind'
+    });
+  });
+  it('returns a safe empty result when provider fails', async () => {
+    const logger = { warn: vi.fn() };
+    const provider = mockProvider({
+      search: vi.fn().mockRejectedValue(new ProviderError('unauthorized', 'do not leak details'))
+    });
+    const app = createApp(new ProviderSubtitleService(provider, 'secret', logger));
+
+    const response = await request(app).get('/subtitles/movie/tt0133093.json');
+    expect(response.status).toBe(200);
+    expect(response.body).toEqual({ subtitles: [] });
+    expect(logger.warn).toHaveBeenCalledWith(
+      '[IndoSync] Subtitle provider search failed (unauthorized).'
+    );
+  });
+
+  it('downloads WebVTT through a valid signed reference', async () => {
+    const provider = mockProvider({ search: vi.fn().mockResolvedValue([candidate]) });
+    const service = new ProviderSubtitleService(provider, 'secret');
+    const app = createApp(service);
+    const search = await request(app).get('/subtitles/movie/tt0133093.json');
+    const pathname = new URL(search.body.subtitles[0].url).pathname;
+
+    const response = await request(app).get(pathname);
+    expect(response.status).toBe(200);
+    expect(response.headers['content-type']).toContain('text/vtt');
+    expect(response.text).toContain('WEBVTT');
+    expect(provider.download).toHaveBeenCalledWith('42');
+  });
+
+  it('rejects unsigned download references without calling provider', async () => {
+    const provider = mockProvider();
+    const app = createApp(new ProviderSubtitleService(provider, 'secret'));
+    const response = await request(app).get('/subtitles/provider/42.invalid.vtt');
+
+    expect(response.status).toBe(404);
+    expect(provider.download).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['unauthorized', 502],
+    ['rate_limited', 429],
+    ['timeout', 504]
+  ] as const)('maps download error %s to safe HTTP %s', async (code, status) => {
+    const provider = mockProvider({
+      search: vi.fn().mockResolvedValue([candidate]),
+      download: vi.fn().mockRejectedValue(
+        new ProviderError(code, 'provider detail must not leak', code === 'rate_limited' ? 7 : undefined)
+      )
+    });
+    const app = createApp(new ProviderSubtitleService(provider, 'secret'));
+    const search = await request(app).get('/subtitles/movie/tt0133093.json');
+    const pathname = new URL(search.body.subtitles[0].url).pathname;
+    const response = await request(app).get(pathname);
+
+    expect(response.status).toBe(status);
+    expect(response.body).toEqual({ error: 'Subtitle is temporarily unavailable.' });
+    expect(JSON.stringify(response.body)).not.toContain('provider detail');
+    if (code === 'rate_limited') expect(response.headers['retry-after']).toBe('7');
+  });
+});
+
+
+
+
+
+===== FILE: tests/opensubtitles-provider.test.ts =====
+
+import { describe, expect, it, vi } from 'vitest';
+import { ProviderError } from '../src/subtitles/provider.js';
+import { OpenSubtitlesProvider } from '../src/subtitles/providers/opensubtitles.js';
+import type { SubtitleSearchRequest } from '../src/subtitles/types.js';
+
+const movie: SubtitleSearchRequest = { type: 'movie', imdbId: 'tt0133093' };
+const series: SubtitleSearchRequest = {
+  type: 'series',
+  imdbId: 'tt0944947',
+  season: 1,
+  episode: 3
+};
+
+function searchItem(language = 'id', season = 1, episode = 3) {
+  return {
+    attributes: {
+      language,
+      feature_details: { season_number: season, episode_number: episode },
+      files: [{ file_id: 42, file_name: 'release.id.srt' }]
+    }
+  };
+}
+
+function provider(fetchImplementation: typeof fetch) {
+  return new OpenSubtitlesProvider({
+    apiKey: 'unit-test-key',
+    fetchImplementation,
+    timeoutMs: 20
+  });
+}
+
+function jsonResponse(body: unknown, status = 200, headers?: HeadersInit): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: { 'Content-Type': 'application/json', ...headers }
+  });
+}
+
+describe('OpenSubtitlesProvider', () => {
+  it('requires a consumer API key', () => {
+    expect(() => new OpenSubtitlesProvider({ apiKey: ' ' })).toThrowError(
+      expect.objectContaining({ code: 'missing_configuration' })
+    );
+  });
+
+  it('searches movies by normalized IMDb ID and Indonesian language', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ data: [searchItem()] }));
+    const result = await provider(fetchMock).search(movie);
+
+    const url = new URL(String(fetchMock.mock.calls[0][0]));
+    expect(url.pathname).toBe('/api/v1/subtitles');
+    expect(url.searchParams.get('imdb_id')).toBe('133093');
+    expect(url.searchParams.get('languages')).toBe('id');
+    expect(url.searchParams.has('season_number')).toBe(false);
+    expect(fetchMock.mock.calls[0][1]?.headers).toMatchObject({
+      'Api-Key': 'unit-test-key',
+      'User-Agent': 'IndoSync/0.1.0'
+    });
+    expect(result[0]).toMatchObject({ reference: '42', language: 'id' });
+  });
+
+  it('maps season/episode and excludes another episode or language', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(
+      jsonResponse({ data: [searchItem('en'), searchItem('id', 1, 2), searchItem('id', 1, 3)] })
+    );
+    const result = await provider(fetchMock).search(series);
+
+    const url = new URL(String(fetchMock.mock.calls[0][0]));
+    expect(url.searchParams.get('season_number')).toBe('1');
+    expect(url.searchParams.get('episode_number')).toBe('3');
+    expect(result).toHaveLength(1);
+    expect(result[0].language).toBe('id');
+  });
+
+  it('returns no candidates for no-result responses', async () => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ data: [] }));
+    await expect(provider(fetchMock).search(movie)).resolves.toEqual([]);
+  });
+
+  it.each([401, 403])('maps HTTP %s to unauthorized', async (status) => {
+    const fetchMock = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({}, status));
+    await expect(provider(fetchMock).search(movie)).rejects.toMatchObject({ code: 'unauthorized' });
+  });
+
+  it('maps HTTP 429 and preserves Retry-After without retrying', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({}, 429, { 'Retry-After': '12' }));
+    await expect(provider(fetchMock).search(movie)).rejects.toMatchObject({
+      code: 'rate_limited',
+      retryAfterSeconds: 12
+    });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('maps timeout and network failures safely', async () => {
+    const timeoutFetch = vi
+      .fn<typeof fetch>()
+      .mockRejectedValue(new DOMException('timed out', 'TimeoutError'));
+    await expect(provider(timeoutFetch).search(movie)).rejects.toMatchObject({ code: 'timeout' });
+
+    const networkFetch = vi.fn<typeof fetch>().mockRejectedValue(new Error('secret network detail'));
+    await expect(provider(networkFetch).search(movie)).rejects.toMatchObject({ code: 'unavailable' });
+  });
+
+  it('rejects malformed JSON and malformed provider structures', async () => {
+    const badJson = vi.fn<typeof fetch>().mockResolvedValue(new Response('{', { status: 200 }));
+    await expect(provider(badJson).search(movie)).rejects.toMatchObject({
+      code: 'malformed_response'
+    });
+
+    const badShape = vi.fn<typeof fetch>().mockResolvedValue(jsonResponse({ data: null }));
+    await expect(provider(badShape).search(movie)).rejects.toMatchObject({
+      code: 'malformed_response'
+    });
+  });
+
+  it('uses the documented download flow and validates WebVTT', async () => {
+    const fetchMock = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(
+        jsonResponse({
+          link: 'https://dl.opensubtitles.com/file/temporary',
+          file_name: 'subtitle.vtt'
+        })
+      )
+      .mockResolvedValueOnce(
+        new Response('WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHalo', {
+          headers: { 'Content-Type': 'text/vtt' }
+        })
+      );
+
+    const result = await provider(fetchMock).download('42');
+    const downloadRequest = fetchMock.mock.calls[0];
+    expect(String(downloadRequest[0])).toBe('https://api.opensubtitles.com/api/v1/download');
+    expect(downloadRequest[1]?.method).toBe('POST');
+    expect(JSON.parse(String(downloadRequest[1]?.body))).toEqual({
+      file_id: 42,
+      sub_format: 'webvtt'
+    });
+    expect(result.content).toContain('WEBVTT');
+  });
+
+  it('rejects invalid WebVTT and untrusted temporary URLs', async () => {
+    const untrusted = vi
+      .fn<typeof fetch>()
+      .mockResolvedValue(jsonResponse({ link: 'https://attacker.example/subtitle.vtt' }));
+    await expect(provider(untrusted).download('42')).rejects.toMatchObject({
+      code: 'malformed_response'
+    });
+
+    const invalidVtt = vi
+      .fn<typeof fetch>()
+      .mockResolvedValueOnce(jsonResponse({ link: 'https://dl.opensubtitles.com/file/temporary' }))
+      .mockResolvedValueOnce(new Response('not a subtitle'));
+    await expect(provider(invalidVtt).download('42')).rejects.toMatchObject({
+      code: 'invalid_subtitle'
+    });
+  });
+});
+
