@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import {
+  parseWebVttCues,
   transformWebVtt,
   validateWebVtt
 } from '../src/subtitles/webvtt.js';
@@ -660,5 +661,51 @@ describe('WebVTT timestamp transformation', () => {
     expect(validateWebVtt(input)).toBe(
       'WEBVTT\n\narbitrary body'
     );
+  });
+});
+
+describe('structured WebVTT cue parsing', () => {
+  it('returns cue text and millisecond intervals with identifiers and settings', () => {
+    const input = [
+      '\uFEFFWEBVTT example',
+      'Kind: captions',
+      '',
+      'STYLE',
+      '::cue { color: lime; }',
+      '',
+      'cue-1',
+      '00:01.250 --> 00:03.500 align:start position:10%',
+      'Halo <b>dunia</b>',
+      'baris kedua',
+      '',
+      '00:00:05.000 --> 00:00:06.000',
+      'Sampai jumpa'
+    ].join('\n');
+
+    expect(parseWebVttCues(input)).toEqual([
+      {
+        text: 'Halo <b>dunia</b>\nbaris kedua',
+        startMs: 1_250,
+        endMs: 3_500
+      },
+      {
+        text: 'Sampai jumpa',
+        startMs: 5_000,
+        endMs: 6_000
+      }
+    ]);
+  });
+
+  it('returns an empty list for a valid document without cues', () => {
+    expect(parseWebVttCues('WEBVTT\n')).toEqual([]);
+  });
+
+  it('rejects invalid cue intervals and malformed cue timing', () => {
+    expect(() =>
+      parseWebVttCues('WEBVTT\n\n00:00:02.000 --> 00:00:01.000\nInvalid')
+    ).toThrow('greater than');
+    expect(() =>
+      parseWebVttCues('WEBVTT\n\n00:00:XX.000 --> 00:00:02.000\nInvalid')
+    ).toThrow('malformed timestamp');
   });
 });

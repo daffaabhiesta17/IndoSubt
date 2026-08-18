@@ -11,6 +11,12 @@ export interface WebVttTimestampMapping {
   offsetMs?: number;
 }
 
+export interface WebVttCue {
+  text: string;
+  startMs: number;
+  endMs: number;
+}
+
 interface DocumentBlock {
   block: string;
   followingSeparator: string;
@@ -48,6 +54,41 @@ const timingLinePattern = new RegExp(
 );
 
 const maximumSafeTimestamp = BigInt(Number.MAX_SAFE_INTEGER);
+
+/**
+ * Parses validated WebVTT cue blocks into evidence-friendly structured data.
+ * Cue text is returned without interpreting markup or discovering alignment.
+ */
+export function parseWebVttCues(content: string): WebVttCue[] {
+  const blocks = splitDocumentBlocks(validateWebVtt(content));
+  const cues: WebVttCue[] = [];
+
+  // The first block contains the WEBVTT header and optional header metadata.
+  for (let index = 1; index < blocks.length; index += 1) {
+    const lines = readBlockLines(blocks[index].block);
+    if (lines.length === 0 || isSpecialBlock(lines[0].text)) continue;
+
+    const timingLineIndex = findTimingLineIndex(lines);
+    const timing = parseTimingLine(lines[timingLineIndex].text);
+    if (!timing) {
+      throw new Error('WebVTT cue timing line contains a malformed timestamp.');
+    }
+    if (timing.start.milliseconds >= timing.end.milliseconds) {
+      throw new Error('WebVTT cue end timestamp must be greater than its start timestamp.');
+    }
+
+    cues.push({
+      text: lines
+        .slice(timingLineIndex + 1)
+        .map((line) => line.text)
+        .join('\n'),
+      startMs: timing.start.milliseconds,
+      endMs: timing.end.milliseconds
+    });
+  }
+
+  return cues;
+}
 
 /**
  * Applies a known linear mapping to WebVTT cue timestamps.
