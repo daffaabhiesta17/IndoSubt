@@ -73,6 +73,29 @@ describe('ffprobe media probe', () => {
     }
   );
 
+  it('rejects malformed entries inside the stream array', () => {
+    expect(() =>
+      parseFfprobeOutput(JSON.stringify({ streams: [null], format: {} }))
+    ).toThrowError(expect.objectContaining({ code: 'malformed_output' }));
+  });
+
+  it('parses multiple audio streams without dropping their order', () => {
+    expect(
+      parseFfprobeOutput(
+        JSON.stringify({
+          streams: [
+            { codec_type: 'audio', codec_name: 'aac', sample_rate: '48000', channels: 2 },
+            { codec_type: 'audio', codec_name: 'ac3', sample_rate: '48000', channels: 6 }
+          ],
+          format: { duration: '5' }
+        })
+      ).audioStreams
+    ).toEqual([
+      { codec: 'aac', sampleRateHz: 48_000, channels: 2 },
+      { codec: 'ac3', sampleRateHz: 48_000, channels: 6 }
+    ]);
+  });
+
   it('rejects malformed audio and duration metadata', () => {
     expect(() =>
       parseFfprobeOutput(

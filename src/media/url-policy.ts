@@ -100,7 +100,10 @@ export class RemoteMediaUrlPolicy {
       ? [{ address: hostname, family: literalFamily as 4 | 6 }]
       : await this.resolve(hostname);
 
-    if (addresses.length === 0 || addresses.some(({ address }) => !isPublicIpAddress(address))) {
+    if (
+      addresses.length === 0 ||
+      addresses.some(({ address, family }) => isIP(address) !== family || !isPublicIpAddress(address))
+    ) {
       throw new MediaProbeError('forbidden_source', 'Remote media host resolves to a non-public address.');
     }
 

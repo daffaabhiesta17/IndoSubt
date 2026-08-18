@@ -9,6 +9,7 @@ import {
   ProviderSubtitleService,
   type SubtitleService
 } from './subtitles/service.js';
+import type { SynchronizationSubtitleDelivery } from './subtitles/synchronization-delivery.js';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const publicDirectory = path.resolve(currentDirectory, '../public');
@@ -83,7 +84,14 @@ function serviceFromEnvironment(): SubtitleService {
   );
 }
 
-export function createApp(subtitleService: SubtitleService = serviceFromEnvironment()) {
+export interface AppOptions {
+  synchronizationDelivery?: SynchronizationSubtitleDelivery;
+}
+
+export function createApp(
+  subtitleService: SubtitleService = serviceFromEnvironment(),
+  options: AppOptions = {}
+) {
   const app = express();
 
   app.use((request, response, next) => {
@@ -126,25 +134,23 @@ export function createApp(subtitleService: SubtitleService = serviceFromEnvironm
 
   app.get('/subtitles/:type/:id.json', handleSubtitleRequest);
 
+  if (options.synchronizationDelivery) {
+    app.get('/subtitles/synchronization/:reference.vtt', async (request, response) => {
+      try {
+        const subtitle = await options.synchronizationDelivery!.download(request.params.reference);
+        response.type(subtitle.contentType).send(subtitle.content);
+      } catch (error) {
+        sendSubtitleError(response, error);
+      }
+    });
+  }
+
   app.get('/subtitles/provider/:reference.vtt', async (request, response) => {
     try {
       const subtitle = await subtitleService.download(request.params.reference);
       response.type(subtitle.contentType).send(subtitle.content);
     } catch (error) {
-      const providerError = error instanceof ProviderError ? error : undefined;
-      if (providerError?.retryAfterSeconds !== undefined) {
-        response.setHeader('Retry-After', String(providerError.retryAfterSeconds));
-      }
-
-      const status =
-        providerError?.code === 'not_found' || providerError?.code === 'invalid_subtitle'
-          ? 404
-          : providerError?.code === 'rate_limited'
-            ? 429
-            : providerError?.code === 'timeout'
-              ? 504
-              : 502;
-      response.status(status).json({ error: 'Subtitle is temporarily unavailable.' });
+      sendSubtitleError(response, error);
     }
   });
 
@@ -155,6 +161,23 @@ export function createApp(subtitleService: SubtitleService = serviceFromEnvironm
   app.get('/subtitles/:type/:id', handleSubtitleRequest);
 
   return app;
+}
+
+
+function sendSubtitleError(response: express.Response, error: unknown): void {
+  const providerError = error instanceof ProviderError ? error : undefined;
+  if (providerError?.retryAfterSeconds !== undefined) {
+    response.setHeader('Retry-After', String(providerError.retryAfterSeconds));
+  }
+  const status =
+    providerError?.code === 'not_found' || providerError?.code === 'invalid_subtitle'
+      ? 404
+      : providerError?.code === 'rate_limited'
+        ? 429
+        : providerError?.code === 'timeout'
+          ? 504
+          : 502;
+  response.status(status).json({ error: 'Subtitle is temporarily unavailable.' });
 }
 
 export const app = createApp();

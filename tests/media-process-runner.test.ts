@@ -35,4 +35,24 @@ describe('spawn process runner', () => {
       })
     ).rejects.toMatchObject({ code: 'output_too_large' });
   });
+
+  it('applies the output limit to stderr as well as stdout', async () => {
+    const runner = new SpawnProcessRunner();
+    await expect(
+      runner.run(execPath, ['-e', "process.stderr.write('x'.repeat(10000))"], {
+        timeoutMs: 2_000,
+        maxOutputBytes: 100
+      })
+    ).rejects.toMatchObject({ code: 'output_too_large' });
+  });
+
+  it('maps executable spawn failure to a controlled process error', async () => {
+    const runner = new SpawnProcessRunner();
+    await expect(
+      runner.run('indosync-definitely-missing-executable', [], {
+        timeoutMs: 2_000,
+        maxOutputBytes: 100
+      })
+    ).rejects.toMatchObject({ code: 'process_failed' });
+  });
 });

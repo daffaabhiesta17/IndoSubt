@@ -18,6 +18,13 @@ function policy(resolveHost: HostResolver = publicResolver) {
 }
 
 describe('remote media URL policy', () => {
+  it('denies every host by default', async () => {
+    const defaultPolicy = new RemoteMediaUrlPolicy({ resolveHost: publicResolver });
+    await expect(
+      defaultPolicy.validate('https://media.example.com/video.mp4')
+    ).rejects.toMatchObject({ code: 'forbidden_source' });
+  });
+
   it('accepts an allow-listed HTTP or HTTPS host resolving only to public IPs', async () => {
     const result = await policy().validate('https://media.example.com/video.mp4?token=value');
     expect(result.url.hostname).toBe('media.example.com');
@@ -88,6 +95,20 @@ describe('remote media URL policy', () => {
     await expect(policy(resolveHost).validate('https://media.example.com/video')).rejects.toMatchObject({
       code: 'forbidden_source'
     });
+  });
+
+  it('rejects an empty DNS result', async () => {
+    await expect(
+      policy(vi.fn().mockResolvedValue([])).validate('https://media.example.com/video')
+    ).rejects.toMatchObject({ code: 'forbidden_source' });
+  });
+
+  it('rejects resolver output whose address family is inconsistent', async () => {
+    await expect(
+      policy(
+        vi.fn().mockResolvedValue([{ address: '93.184.216.34', family: 6 }])
+      ).validate('https://media.example.com/video')
+    ).rejects.toMatchObject({ code: 'forbidden_source' });
   });
 
   it('rejects credentials and fragments', async () => {

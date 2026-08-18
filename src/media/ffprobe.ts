@@ -121,8 +121,11 @@ export function parseFfprobeOutput(output: string): MediaProbeResult {
     throw new MediaProbeError('malformed_output', 'ffprobe format output is malformed.');
   }
 
-  const audioStreams = (payload.streams ?? [])
-    .filter(isRecord)
+  const streams = payload.streams ?? [];
+  if (streams.some((stream) => !isRecord(stream))) {
+    throw new MediaProbeError('malformed_output', 'ffprobe stream entry is malformed.');
+  }
+  const audioStreams = streams
     .filter((stream) => stream.codec_type === 'audio')
     .map(parseAudioStream);
   const format = payload.format as FfprobeFormat | undefined;

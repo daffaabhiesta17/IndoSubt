@@ -1,4 +1,4 @@
-﻿import { describe, expect, it, vi } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import {
   FfmpegAudioExtractor,
   type AudioExtractionOptions
@@ -28,6 +28,12 @@ function waveBytes(
   bytes.set(Buffer.from('data'), 36);
   view.setUint32(40, dataSize, true);
   return bytes;
+}
+
+function setWaveUint32(bytes: Uint8Array, offset: number, value: number): Uint8Array {
+  const copy = new Uint8Array(bytes);
+  new DataView(copy.buffer).setUint32(offset, value, true);
+  return copy;
 }
 
 function setup(result?: Partial<ProcessRunResult>) {
@@ -78,13 +84,81 @@ describe('bounded ffmpeg audio extractor', () => {
     expect(executable).toBe('ffmpeg-test');
     expect(args[args.indexOf('-ac') + 1]).toBe('1');
     expect(args[args.indexOf('-ar') + 1]).toBe('16000');
-    expect(args[args.indexOf('-t') + 1]).toBe('120.000');
+    expect(args[args.indexOf('-t') + 1]).toBe('120');
     expect(args[args.indexOf('-protocol_whitelist') + 1]).toBe('http,https,tcp,tls');
     expect(args[args.indexOf('-follow_redirects') + 1]).toBe('0');
     expect(args.at(-1)).toBe('pipe:1');
     expect(runOptions).toEqual({ timeoutMs: 15_000, maxOutputBytes: 4_000_000 });
   });
 
+  it.each([
+    [undefined, '0'],
+    [0, '0'],
+    [1, '0.001'],
+    [10, '0.010'],
+    [999, '0.999'],
+    [1_000, '1'],
+    [12_345, '12.345']
+  ] as const)('formats startMs %s deterministically as %s', async (startMs, expected) => {
+    const { runner } = await extract(startMs === undefined ? undefined : { startMs });
+    const args = vi.mocked(runner.run).mock.calls[0][1];
+    expect(args[args.indexOf('-ss') + 1]).toBe(expected);
+    expect(args.filter((argument) => argument === '-ss')).toHaveLength(1);
+  });
+
+  it('places output seeking after input and before bounded duration', async () => {
+    const { runner } = await extract({ startMs: 12_345, maxDurationMs: 5_000 });
+    const args = vi.mocked(runner.run).mock.calls[0][1];
+    const inputIndex = args.indexOf('-i');
+    const seekIndex = args.indexOf('-ss');
+    const durationIndex = args.indexOf('-t');
+    expect(inputIndex).toBeLessThan(seekIndex);
+    expect(seekIndex).toBeLessThan(durationIndex);
+    expect(args[seekIndex + 1]).toBe('12.345');
+    expect(args[durationIndex + 1]).toBe('5');
+    expect(args[args.indexOf('-c:a') + 1]).toBe('pcm_s16le');
+  });
+
+  it.each([
+    -1,
+    0.5,
+    Number.NaN,
+    Number.POSITIVE_INFINITY,
+    Number.NEGATIVE_INFINITY,
+    Number.MAX_SAFE_INTEGER + 1
+  ])('rejects invalid startMs %s before execution', async (startMs) => {
+    const { extractor, runner } = setup();
+    await expect(
+      extractor.extract(
+        { kind: 'remote-url', url: 'https://media.example.com/movie.mp4' },
+        { startMs }
+      )
+    ).rejects.toBeInstanceOf(Error);
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it('rejects extraction-window overflow before execution', async () => {
+    const { extractor, runner } = setup();
+    await expect(
+      extractor.extract(
+        { kind: 'remote-url', url: 'https://media.example.com/movie.mp4' },
+        { startMs: Number.MAX_SAFE_INTEGER, maxDurationMs: 1 }
+      )
+    ).rejects.toThrow('Audio extraction window must remain within the safe integer range.');
+    expect(runner.run).not.toHaveBeenCalled();
+  });
+
+  it('formats a valid large start without scientific notation', async () => {
+    const { runner } = await extract({
+      startMs: Number.MAX_SAFE_INTEGER - 300_000,
+      maxDurationMs: 300_000
+    });
+    const args = vi.mocked(runner.run).mock.calls[0][1];
+    const formatted = args[args.indexOf('-ss') + 1];
+    expect(formatted).toMatch(/^\d+(?:\.\d{3})?$/);
+    expect(formatted.toLowerCase()).not.toContain('e');
+    expect(args[args.indexOf('-t') + 1]).toBe('300');
+  });
   it('keeps the untrusted URL as one literal process argument', async () => {
     const { runner } = await extract();
     const args = vi.mocked(runner.run).mock.calls[0][1];
@@ -109,7 +183,7 @@ describe('bounded ffmpeg audio extractor', () => {
     const runner = context.runner;
     expect(artifact).toMatchObject({ sampleRateHz: 8_000, channels: 2, durationMs: 2 });
     const args = vi.mocked(runner.run).mock.calls[0][1];
-    expect(args[args.indexOf('-t') + 1]).toBe('5.000');
+    expect(args[args.indexOf('-t') + 1]).toBe('5');
     expect(vi.mocked(runner.run).mock.calls[0][2].maxOutputBytes).toBe(200_000);
   });
 
@@ -154,6 +228,24 @@ describe('bounded ffmpeg audio extractor', () => {
         extractor.extract({ kind: 'remote-url', url: 'https://media.example.com/movie.mp4' })
       ).rejects.toMatchObject({ code: 'malformed_output' });
     }
+  });
+
+  it('rejects inconsistent WAV byte rate metadata', async () => {
+    const malformed = setWaveUint32(waveBytes(), 28, 1);
+    const { extractor } = setup({ stdoutBytes: malformed });
+    await expect(
+      extractor.extract({ kind: 'remote-url', url: 'https://media.example.com/movie.mp4' })
+    ).rejects.toMatchObject({ code: 'malformed_output' });
+  });
+
+  it('rejects WAV output whose actual duration exceeds the requested bound', async () => {
+    const { extractor } = setup({ stdoutBytes: waveBytes(16_000, 1, 32_000) });
+    await expect(
+      extractor.extract(
+        { kind: 'remote-url', url: 'https://media.example.com/movie.mp4' },
+        { maxDurationMs: 1_000 }
+      )
+    ).rejects.toMatchObject({ code: 'malformed_output' });
   });
 
   it('propagates runner timeout and output-limit errors', async () => {
