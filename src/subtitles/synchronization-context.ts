@@ -1,6 +1,15 @@
 ﻿import { createHmac, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { MediaSource } from '../media/types.js';
 import type { SynchronizationMapping, SynchronizationPoint } from './synchronization.js';
+import {
+  synchronizationPointsFromEvidence,
+  validateSynchronizationEvidence,
+  type SynchronizationEvidence
+} from './synchronization-evidence.js';
+import type {
+  ApprovedSynchronizationMapping,
+  SynchronizationResultProvenance
+} from './synchronization-result-provenance.js';
 
 export type SynchronizationTaskStatus = 'pending' | 'processing' | 'completed' | 'rejected';
 
@@ -18,7 +27,11 @@ export interface SynchronizationTask {
 export interface SynchronizationResult {
   taskId: string;
   points: readonly SynchronizationPoint[];
+  /** Legacy mapping only; calibrated results must use approvedMapping. */
   mapping?: SynchronizationMapping;
+  provenance?: SynchronizationResultProvenance;
+  evidence?: readonly SynchronizationEvidence[];
+  approvedMapping?: ApprovedSynchronizationMapping;
   confidence: number;
   method: string;
   createdAt: number;
@@ -193,6 +206,94 @@ export function validateSynchronizationResult(result: SynchronizationResult): vo
       throw new Error('Synchronization result pointsUsed is invalid.');
     }
   }
+  validateResultProvenance(result);
+}
+
+function validateResultProvenance(result: SynchronizationResult): void {
+  const provenance = result.provenance;
+  if (!provenance) {
+    if (result.evidence || result.approvedMapping) {
+      throw new Error('Synchronization calibrated result provenance is required.');
+    }
+    return;
+  }
+  if (provenance.kind === 'legacy-estimator') {
+    version(provenance.estimatorVersion, 'legacy estimator version');
+    if (result.evidence || result.approvedMapping) {
+      throw new Error('Synchronization legacy result cannot contain calibrated approval data.');
+    }
+    return;
+  }
+  if (provenance.kind !== 'calibrated-model-selection') {
+    throw new Error('Synchronization result provenance is invalid.');
+  }
+  if (!['rejected', 'accepted', 'approved'].includes(provenance.state)) {
+    throw new Error('Synchronization calibrated result state is invalid.');
+  }
+  version(provenance.policyId, 'policy id');
+  version(provenance.policyVersion, 'policy version');
+  version(provenance.modelSelectionVersion, 'model selection version');
+  if (result.mapping) {
+    throw new Error('Synchronization calibrated result must not contain a legacy mapping.');
+  }
+  if (!result.evidence) {
+    throw new Error('Synchronization calibrated result evidence is required.');
+  }
+  if (result.evidence.length > 0) {
+    validateSynchronizationEvidence(result.evidence);
+    const projected = synchronizationPointsFromEvidence(result.evidence);
+    if (projected.length !== result.points.length || projected.some((point, index) =>
+      point.sourceMs !== result.points[index].sourceMs ||
+      point.referenceMs !== result.points[index].referenceMs
+    )) {
+      throw new Error('Synchronization result points do not match raw evidence.');
+    }
+  } else if (result.points.length !== 0) {
+    throw new Error('Synchronization rejected result points require raw evidence.');
+  }
+  if (provenance.state === 'approved') {
+    if (!result.approvedMapping) {
+      throw new Error('Synchronization approved result mapping is required.');
+    }
+    validateApprovedMapping(result.approvedMapping, provenance, result.evidence.length);
+  } else if (result.approvedMapping) {
+    throw new Error('Synchronization unapproved result must not contain an approved mapping.');
+  }
+  if (provenance.state !== 'rejected' && result.evidence.length === 0) {
+    throw new Error('Synchronization accepted result requires evidence.');
+  }
+}
+
+function validateApprovedMapping(
+  mapping: ApprovedSynchronizationMapping,
+  provenance: Extract<SynchronizationResultProvenance, { kind: 'calibrated-model-selection' }>,
+  evidenceCount: number
+): void {
+  if (mapping.acceptanceStatus !== 'approved') throw new Error('Synchronization mapping approval status is invalid.');
+  if (mapping.model !== 'offset-only' && mapping.model !== 'affine') throw new Error('Synchronization approved mapping model is invalid.');
+  if (!Number.isFinite(mapping.scale) || mapping.scale <= 0 || !Number.isFinite(mapping.offsetMs)) {
+    throw new Error('Synchronization approved mapping parameters are invalid.');
+  }
+  nonNegativeFinite(mapping.meanAbsoluteResidualMs, 'approved mapping residual');
+  confidence(mapping.inlierRatio);
+  confidence(mapping.temporalCoverage);
+  if (!Number.isSafeInteger(mapping.inlierCount) || mapping.inlierCount < 1 ||
+      !Number.isSafeInteger(mapping.evidenceCount) || mapping.evidenceCount !== evidenceCount ||
+      mapping.inlierCount > mapping.evidenceCount) {
+    throw new Error('Synchronization approved mapping evidence counts are invalid.');
+  }
+  if (mapping.policyId !== provenance.policyId || mapping.policyVersion !== provenance.policyVersion ||
+      mapping.modelSelectionVersion !== provenance.modelSelectionVersion) {
+    throw new Error('Synchronization approved mapping provenance does not match result provenance.');
+  }
+}
+
+function version(value: string, label: string): void {
+  if (!/^[A-Za-z0-9._:-]{1,64}$/.test(value)) throw new Error(`Synchronization ${label} is invalid.`);
+}
+
+function nonNegativeFinite(value: number, label: string): void {
+  if (!Number.isFinite(value) || value < 0) throw new Error(`Synchronization ${label} is invalid.`);
 }
 
 function validateOpaqueId(value: string, label: string): void {

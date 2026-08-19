@@ -11,8 +11,20 @@ import {
   validateSynchronizationResult
 } from './synchronization-context.js';
 
+export interface SynchronizationWorkerMetrics {
+  evidenceEngineDurationMs?: number;
+  asrDurationMs?: number;
+  whisperRevision?: string;
+  labseRevision?: string;
+}
+
+export interface SynchronizationWorkerContext {
+  signal?: AbortSignal;
+  reportMetrics?: (metrics: Readonly<SynchronizationWorkerMetrics>) => void;
+}
+
 export interface SynchronizationWorker {
-  process(task: SynchronizationTask): Promise<SynchronizationResult>;
+  process(task: SynchronizationTask, context?: SynchronizationWorkerContext): Promise<SynchronizationResult>;
 }
 
 export interface SynchronizationMappingPolicy {
