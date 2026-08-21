@@ -264,3 +264,7 @@ function sendSubtitleError(response: express.Response, error: unknown): void {
 
 export const app = createApp();
 
+// Vercel's Express preset discovers src/app.ts and requires the Express app
+// itself to be the module's default export.
+export default app;
+

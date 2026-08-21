@@ -13,10 +13,10 @@ const testDirectory = path.dirname(fileURLToPath(import.meta.url));
 const testApp = createApp(new FixtureSubtitleService());
 
 describe('IndoSync Phase 1 Stremio protocol', () => {
-  it('exports the Express app as a named export', async () => {
-    const { app: namedApp } = await import('../src/app.js');
+  it('exports the Express app as Vercel-compatible default export', async () => {
+    const { default: app, app: namedApp } = await import('../src/app.js');
 
-    expect(namedApp).toBeDefined();
+    expect(app).toBe(namedApp);
   });
 
   it('serves a valid minimal subtitle manifest', async () => {
