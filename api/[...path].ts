@@ -13,6 +13,17 @@ let optionsPromise: Promise<AppOptions> | undefined;
 
 async function buildOptions(): Promise<AppOptions> {
   const apiKey = process.env.OPENSUBTITLES_API_KEY?.trim();
+  console.log(JSON.stringify({
+    event: 'build_options',
+    hasApiKey: Boolean(apiKey),
+    syncFlag: process.env.INDOSYNC_CALIBRATED_SYNCHRONIZATION,
+    target: process.env.INDOSYNC_CALIBRATED_TARGET,
+    runtime: process.env.INDOSYNC_RUNTIME_ENV,
+    vercelEnv: process.env.VERCEL_ENV,
+    namespace: process.env.INDOSYNC_SYNCHRONIZATION_NAMESPACE,
+    credentialEnv: process.env.INDOSYNC_REDIS_CREDENTIAL_ENV,
+    engineCommand: process.env.INDOSYNC_EVIDENCE_ENGINE_COMMAND
+  }));
   const provider = apiKey
     ? new OpenSubtitlesProvider({
         apiKey,
