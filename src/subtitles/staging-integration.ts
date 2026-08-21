@@ -11,6 +11,16 @@ import type {
   SynchronizationTask,
   SynchronizationTaskStore
 } from './synchronization-context.js';
+import type { TorboxResolver } from './torbox-resolver.js';
+
+export interface StagingSynchronizationIntegration {
+  readonly delivery: SynchronizationSubtitleDelivery;
+  issue(
+    metadata: SubtitleRequestMetadata,
+    imdbId: string | undefined,
+    subtitle: Readonly<{ id: string; url: string; lang: string }> | undefined
+  ): Promise<string | undefined>;
+}
 
 /**
  * Staging-only, additive IndoSync integration boundary.
@@ -19,38 +29,50 @@ import type {
  * fast Upstash writes, no GPU inference) and delivery falls back to the
  * original subtitle unless an approved mapping is present.
  */
-export interface StagingSynchronizationIntegration {
-  readonly delivery: SynchronizationSubtitleDelivery;
-  issue(
-    metadata: SubtitleRequestMetadata,
-    subtitle: Readonly<{ id: string; url: string; lang: string }> | undefined
-  ): Promise<string | undefined>;
-}
-
 export class StagingSynchronizationIntegrationImpl implements StagingSynchronizationIntegration {
   readonly delivery: SynchronizationSubtitleDelivery;
+
+  private readonly torboxResolver?: TorboxResolver;
 
   constructor(
     private readonly orchestrator: SynchronizationOrchestrator,
     private readonly jobStore: SynchronizationJobStore,
     private readonly now: () => number,
-    provider: SubtitleProvider
+    provider: SubtitleProvider,
+    torboxResolver?: TorboxResolver
   ) {
     this.delivery = new OrchestratedSynchronizationSubtitleDelivery(provider, orchestrator);
+    this.torboxResolver = torboxResolver;
   }
 
   async issue(
     metadata: SubtitleRequestMetadata,
+    imdbId: string | undefined,
     subtitle: Readonly<{ id: string; url: string; lang: string }> | undefined
   ): Promise<string | undefined> {
-    const host = (() => { try { return metadata.videoUrl ? new URL(metadata.videoUrl).hostname : undefined; } catch { return undefined; } })();
-    console.log(JSON.stringify({ event: 'indosync_issue', hasVideoUrl: !!metadata.videoUrl, videoHost: host, subtitleId: subtitle?.id }));
-    if (!metadata.videoUrl) return undefined;
+    let videoUrl = metadata.videoUrl;
+    const host = (() => { try { return videoUrl ? new URL(videoUrl).hostname : undefined; } catch { return undefined; } })();
+    console.log(JSON.stringify({ event: 'indosync_issue', hasVideoUrl: !!videoUrl, videoHost: host, subtitleId: subtitle?.id, filename: metadata.filename }));
     if (!subtitle) return undefined;
     const candidate = synchronizationCandidate(subtitle);
     if (!candidate) return undefined;
+    if (!videoUrl && this.torboxResolver && imdbId) {
+      try {
+        const resolved = await this.torboxResolver.resolve(imdbId, metadata.filename);
+        if (resolved) {
+          videoUrl = resolved;
+          console.log(JSON.stringify({ event: 'indosync_torbox_resolved', imdbId }));
+        } else {
+          console.log(JSON.stringify({ event: 'indosync_torbox_nomatch', imdbId }));
+        }
+      } catch (error) {
+        console.log(JSON.stringify({ event: 'indosync_torbox_error', error: error instanceof Error ? error.message : String(error) }));
+      }
+    }
+    if (!videoUrl) return undefined;
+    const enriched: SubtitleRequestMetadata = { ...metadata, videoUrl };
     try {
-      const { task, reference } = await this.orchestrator.createTask(metadata, candidate);
+      const { task, reference } = await this.orchestrator.createTask(enriched, candidate);
       const job = createSynchronizationJob(task, this.currentTime(), 3);
       await this.jobStore.enqueue(job);
       return reference;

@@ -29,6 +29,7 @@ import {
   UpstashSynchronizationResultStore,
   UpstashSynchronizationTaskStore
 } from './upstash-synchronization-store.js';
+import { TorboxApiResolver } from './torbox-resolver.js';
 
 export interface StagingSynchronizationComposition {
   environment: 'staging';
@@ -91,7 +92,11 @@ export async function createStagingSynchronizationComposition(
   });
   const now = dependencies.now ?? Date.now;
   const bridgedWorker = new StagingSynchronizationWorkerBridge(worker, orchestrator, taskStore, referenceCodec, now);
-  const integration = new StagingSynchronizationIntegrationImpl(orchestrator, store, now, dependencies.provider);
+  const torboxKey = environment.TORBOX_API_KEY?.trim();
+  const torboxResolver = torboxKey
+    ? new TorboxApiResolver(torboxKey)
+    : undefined;
+  const integration = new StagingSynchronizationIntegrationImpl(orchestrator, store, now, dependencies.provider, torboxResolver);
   const readiness = await auditCalibratedSynchronizationReadiness(config, true);
   if (readiness.status !== 'ready') throw new Error(`Staging synchronization is not ready: ${readiness.reasons.join(',')}`);
   return {

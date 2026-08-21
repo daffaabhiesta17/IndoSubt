@@ -1,5 +1,5 @@
 ﻿import request from 'supertest';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import { ProviderError, type SubtitleProvider } from '../src/subtitles/provider.js';
 import type { SubtitleCandidateRanker } from '../src/subtitles/ranker.js';
@@ -30,6 +30,13 @@ const candidate: SubtitleCandidate = {
 };
 
 describe('Phase 2A subtitle service and Stremio mapping', () => {
+  beforeEach(() => {
+    process.env.INDOSYNC_SHIFT_VARIANTS = 'true';
+  });
+  afterEach(() => {
+    delete process.env.INDOSYNC_SHIFT_VARIANTS;
+  });
+
   it('maps provider candidates to signed IndoSync URLs and lang ind', async () => {
     const provider = mockProvider({ search: vi.fn().mockResolvedValue([candidate]) });
     const app = createApp(new ProviderSubtitleService(provider, 'test-signing-secret'));
@@ -45,8 +52,8 @@ describe('Phase 2A subtitle service and Stremio mapping', () => {
     );
     expect(response.body.subtitles[0].url).not.toContain('test-signing-secret');
     expect(response.body.subtitles).toHaveLength(3);
-    expect(response.body.subtitles[1].url).toMatch(/\/subtitles\/shift\/-2000\//);
-    expect(response.body.subtitles[2].url).toMatch(/\/subtitles\/shift\/2000\//);
+    expect(response.body.subtitles[1].url).toMatch(/\/subtitles\/shift\/-2000\.vtt\?ref=/);
+    expect(response.body.subtitles[2].url).toMatch(/\/subtitles\/shift\/2000\.vtt\?ref=/);
   });
 
   it('supports the Stremio runtime route without .json and with filename metadata', async () => {
@@ -215,8 +222,8 @@ describe('Phase 2A subtitle service and Stremio mapping', () => {
       'opensubtitles-3'
     ]);
     expect(response.body.subtitles).toHaveLength(7);
-    expect(response.body.subtitles[5].url).toMatch(/\/subtitles\/shift\/-2000\//);
-    expect(response.body.subtitles[6].url).toMatch(/\/subtitles\/shift\/2000\//);
+    expect(response.body.subtitles[5].url).toMatch(/\/subtitles\/shift\/-2000\.vtt\?ref=/);
+    expect(response.body.subtitles[6].url).toMatch(/\/subtitles\/shift\/2000\.vtt\?ref=/);
     expect(response.body.subtitles.every((item: { lang: string }) => item.lang === 'ind')).toBe(true);
   });
 

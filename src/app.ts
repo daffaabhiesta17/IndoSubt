@@ -141,6 +141,8 @@ export function createApp(
         id,
         hasVideoUrl: Boolean(extra.videoUrl),
         videoHost,
+        filename: extra.filename,
+        videoSize: extra.videoSize,
         stagingOn: Boolean(options.stagingSynchronization)
       }));
       const result = await addon.get('subtitles', type, id, extra);
@@ -149,16 +151,17 @@ export function createApp(
       const providerMatch = primary
         ? /\/subtitles\/provider\/(.+)\.vtt$/.exec(new URL(primary.url).pathname)
         : undefined;
-      if (primary && providerMatch) {
+      if (primary && providerMatch && process.env.INDOSYNC_SHIFT_VARIANTS?.trim() === 'true') {
+        const encodedRef = encodeURIComponent(providerMatch[1]);
         result.subtitles.push(
           {
             id: `${primary.id}-shift-minus-2000`,
-            url: `${origin}/subtitles/shift/-2000/${providerMatch[1]}.vtt`,
+            url: `${origin}/subtitles/shift/-2000.vtt?ref=${encodedRef}`,
             lang: 'ind'
           },
           {
             id: `${primary.id}-shift-plus-2000`,
-            url: `${origin}/subtitles/shift/2000/${providerMatch[1]}.vtt`,
+            url: `${origin}/subtitles/shift/2000.vtt?ref=${encodedRef}`,
             lang: 'ind'
           }
         );
@@ -174,6 +177,7 @@ export function createApp(
             videoSize: extra.videoSize,
             videoUrl: extra.videoUrl
           },
+          id.split(':')[0],
           result.subtitles[0]
         );
         if (reference) {
@@ -212,14 +216,19 @@ export function createApp(
     }
   });
 
-  app.get('/subtitles/shift/:offsetMs/:reference.vtt', async (request, response) => {
+  app.get('/subtitles/shift/:offsetMs.vtt', async (request, response) => {
     try {
       const offsetMs = Number(request.params.offsetMs);
       if (!Number.isSafeInteger(offsetMs) || Math.abs(offsetMs) > 10_000) {
         response.status(400).json({ error: 'Invalid subtitle shift.' });
         return;
       }
-      const subtitle = await subtitleService.download(request.params.reference);
+      const reference = firstParameter(request.query.ref as string | string[] | undefined);
+      if (!reference) {
+        response.status(400).json({ error: 'Missing subtitle reference.' });
+        return;
+      }
+      const subtitle = await subtitleService.download(reference);
       response.type(subtitle.contentType).send(transformWebVtt(subtitle.content, { offsetMs }));
     } catch (error) {
       sendSubtitleError(response, error);
@@ -237,6 +246,7 @@ export function createApp(
 
 
 function sendSubtitleError(response: express.Response, error: unknown): void {
+  console.log(JSON.stringify({ event: 'subtitle_download_error', message: error instanceof Error ? error.message : String(error) }));
   const providerError = error instanceof ProviderError ? error : undefined;
   if (providerError?.retryAfterSeconds !== undefined) {
     response.setHeader('Retry-After', String(providerError.retryAfterSeconds));

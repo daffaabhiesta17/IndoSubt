@@ -1,5 +1,5 @@
 import request from 'supertest';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createApp } from '../src/app.js';
 import type { MediaSourceResolver } from '../src/media/source-resolver.js';
 import type { SubtitleProvider } from '../src/subtitles/provider.js';
@@ -117,6 +117,13 @@ function setup(withStaging: boolean, searchResult: any[] = [], workerResult?: Sy
 }
 
 describe('staging integration parallel IndoSync', () => {
+  beforeEach(() => {
+    process.env.INDOSYNC_SHIFT_VARIANTS = 'true';
+  });
+  afterEach(() => {
+    delete process.env.INDOSYNC_SHIFT_VARIANTS;
+  });
+
   it('default (activation OFF) emits no synchronization reference', async () => {
     const { app } = setup(false, [
       { provider: 'opensubtitles', reference: '42', language: 'id', fileName: 'movie.srt' }
@@ -282,10 +289,10 @@ describe('staging integration parallel IndoSync', () => {
       { provider: 'opensubtitles', reference: '42', language: 'id', fileName: 'movie.srt' }
     ]);
     const listed = await request(app).get('/subtitles/movie/tt0133093.json');
-    const minus = listed.body.subtitles.find((item: { url: string }) => item.url.includes('/shift/-2000/'));
-    const plus = listed.body.subtitles.find((item: { url: string }) => item.url.includes('/shift/2000/'));
-    const minusResponse = await request(app).get(new URL(minus.url).pathname);
-    const plusResponse = await request(app).get(new URL(plus.url).pathname);
+    const minus = listed.body.subtitles.find((item: { url: string }) => item.url.includes('/shift/-2000.vtt?ref='));
+    const plus = listed.body.subtitles.find((item: { url: string }) => item.url.includes('/shift/2000.vtt?ref='));
+    const minusResponse = await request(app).get(new URL(minus.url).pathname + new URL(minus.url).search);
+    const plusResponse = await request(app).get(new URL(plus.url).pathname + new URL(plus.url).search);
     expect(minusResponse.status).toBe(200);
     expect(plusResponse.status).toBe(200);
     expect(minusResponse.text).toMatch(/^WEBVTT/);
