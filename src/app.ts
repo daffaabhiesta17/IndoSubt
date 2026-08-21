@@ -10,6 +10,7 @@ import {
   type SubtitleService
 } from './subtitles/service.js';
 import type { SynchronizationSubtitleDelivery } from './subtitles/synchronization-delivery.js';
+import type { StagingSynchronizationIntegration } from './subtitles/staging-integration.js';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const publicDirectory = path.resolve(currentDirectory, '../public');
@@ -86,6 +87,7 @@ function serviceFromEnvironment(): SubtitleService {
 
 export interface AppOptions {
   synchronizationDelivery?: SynchronizationSubtitleDelivery;
+  stagingSynchronization?: StagingSynchronizationIntegration;
 }
 
 export function createApp(
@@ -126,6 +128,27 @@ export function createApp(
       const type = firstParameter(request.params.type) ?? '';
       const id = firstParameter(request.params.id) ?? '';
       const result = await addon.get('subtitles', type, id, extra);
+      if (options.stagingSynchronization) {
+        // IndoSync is an additive, asynchronous parallel subtitle reference.
+        // Issuance is a fast Upstash write only; the GPU evidence engine runs
+        // in a separate worker. Failures here must never alter the existing
+        // OpenSubtitles response.
+        const reference = await options.stagingSynchronization.issue(
+          {
+            filename: extra.filename,
+            videoSize: extra.videoSize,
+            videoUrl: extra.videoUrl
+          },
+          result.subtitles[0]
+        );
+        if (reference) {
+          result.subtitles.push({
+            id: `indosync-sync-${reference}`,
+            url: `${requestOrigin(request)}/subtitles/synchronization/${encodeURIComponent(reference)}.vtt`,
+            lang: 'ind'
+          });
+        }
+      }
       response.json(result);
     } catch (error) {
       next(error);
