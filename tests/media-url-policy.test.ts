@@ -19,11 +19,16 @@ function policy(resolveHost: HostResolver = publicResolver) {
 }
 
 describe('remote media URL policy', () => {
-  it('denies every host by default', async () => {
+  it('allows any public HTTP(S) host when the allow-list is empty', async () => {
     const defaultPolicy = new RemoteMediaUrlPolicy({ resolveHost: publicResolver });
-    await expect(
-      defaultPolicy.validate('https://media.example.com/video.mp4')
-    ).rejects.toMatchObject({ code: 'forbidden_source' });
+    const result = await defaultPolicy.validate('https://download.torbox.app/file.mp4');
+    expect(result.url.hostname).toBe('download.torbox.app');
+  });
+
+  it('still denies hosts not on an explicit allow-list', async () => {
+    await expect(policy().validate('https://download.torbox.app/file.mp4')).rejects.toMatchObject({
+      code: 'forbidden_source'
+    });
   });
 
   it('accepts an allow-listed HTTP or HTTPS host resolving only to public IPs', async () => {

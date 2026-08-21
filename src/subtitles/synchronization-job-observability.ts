@@ -26,6 +26,7 @@ export interface SynchronizationJobObservation {
   temporalCoverage?: number;
   whisperRevision?: string;
   labseRevision?: string;
+  videoHost?: string;
 }
 
 export interface SynchronizationJobObserver {
@@ -35,6 +36,15 @@ export interface SynchronizationJobObserver {
 export const disabledSynchronizationJobObserver: SynchronizationJobObserver = {
   record: () => undefined
 };
+
+function hostFromUrl(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  try {
+    return new URL(value).hostname;
+  } catch {
+    return undefined;
+  }
+}
 
 export const consoleSynchronizationJobObserver: SynchronizationJobObserver = {
   record: (observation) => {
@@ -46,7 +56,8 @@ export const consoleSynchronizationJobObserver: SynchronizationJobObserver = {
       failureCategory: observation.failureCategory,
       evidenceCount: observation.evidenceCount,
       selectedModel: observation.selectedModel,
-      residualMs: observation.residualMs
+      residualMs: observation.residualMs,
+      videoHost: observation.videoHost ?? hostFromUrl((observation as unknown as { videoUrl?: string }).videoUrl)
     }));
   }
 };

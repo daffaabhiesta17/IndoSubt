@@ -66,7 +66,8 @@ export async function enqueueSynchronizationJob(
     event: 'queued', timestamp: stored.updatedAt, jobId: stored.id,
     correlationId: stored.correlationId, attempt: stored.attempt,
     retryCount: Math.max(0, stored.attempt - 1), workerId: 'enqueue',
-    provider: stored.task.provider, resultState: stored.state
+    provider: stored.task.provider, resultState: stored.state,
+    videoHost: (() => { try { return new URL(stored.task.mediaSource.url).hostname; } catch { return undefined; } })()
   });
   return stored;
 }
@@ -130,7 +131,8 @@ export class SynchronizationJobRunner {
     let heartbeatRunning=false;
     let heartbeatPromise:Promise<void>=Promise.resolve();
     const observe=(event:Parameters<SynchronizationJobObserver['record']>[0])=>Promise.resolve(this.observer.record(event)).catch(()=>undefined);
-    const base=()=>({timestamp:this.now(),jobId:claim.job.id,correlationId:claim.job.correlationId,attempt:claim.job.attempt,retryCount:Math.max(0,claim.job.attempt-1),workerId:this.workerId,provider:claim.job.task.provider});
+    const videoHost = (() => { try { return new URL(claim.job.task.mediaSource.url).hostname; } catch { return undefined; } })();
+    const base=()=>({timestamp:this.now(),jobId:claim.job.id,correlationId:claim.job.correlationId,attempt:claim.job.attempt,retryCount:Math.max(0,claim.job.attempt-1),workerId:this.workerId,provider:claim.job.task.provider,videoHost});
     await observe({event:'claimed',...base(),leaseDurationMs:this.policy.leaseMs});
     const tick=async()=>{
       if(heartbeatRunning||controller.signal.aborted)return;
@@ -226,7 +228,7 @@ export class SynchronizationJobRunner {
 
 function delay(milliseconds:number,signal?:AbortSignal):Promise<void>{
   if(signal?.aborted)return Promise.resolve();
-  return new Promise((resolve)=>{const timer=setTimeout(done,milliseconds);timer.unref();const abort=()=>done();function done(){clearTimeout(timer);signal?.removeEventListener('abort',abort);resolve();}signal?.addEventListener('abort',abort,{once:true});});
+  return new Promise((resolve)=>{const timer=setTimeout(done,milliseconds);const abort=()=>done();function done(){clearTimeout(timer);signal?.removeEventListener('abort',abort);resolve();}signal?.addEventListener('abort',abort,{once:true});});
 }
 
 export function classifySynchronizationFailure(error:unknown,now:number):SynchronizationJobFailure {validateTime(now);if(error instanceof DOMException&&error.name==='AbortError')return{category:'cancelled',message:error.message,retryable:false,occurredAt:now};if(error instanceof EvidenceEngineProcessError){if(error.category==='cancelled')return{category:'cancelled',message:error.message,retryable:false,occurredAt:now};if(error.category==='timeout')return{category:'timeout',message:error.message,retryable:true,occurredAt:now};if(['process_crash','spawn_failure'].includes(error.category))return{category:'process_crash',message:error.message,retryable:true,occurredAt:now};if(error.category==='engine_error'&&/(invalid_request|media_failure)/.test(error.message))return{category:error.message.includes('media_failure')?'invalid_media':'invalid_input',message:error.message,retryable:false,occurredAt:now};return{category:'infrastructure',message:error.message,retryable:true,occurredAt:now};}if(error instanceof MediaProbeError)return{category:'invalid_media',message:error.message,retryable:false,occurredAt:now};if(error instanceof ProviderError){const retryable=['timeout','rate_limited','unavailable'].includes(error.code);return{category:retryable?'infrastructure':'invalid_input',message:error.message,retryable,occurredAt:now};}return{category:'infrastructure',message:'Synchronization worker failed.',retryable:true,occurredAt:now};}

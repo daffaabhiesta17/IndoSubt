@@ -60,7 +60,7 @@ export class RemoteMediaUrlPolicy {
     this.allowedHosts = new Set(
       (options.allowedHosts ?? []).map((host) => normalizeAllowedHost(host))
     );
-    this.allowedPorts = new Set(options.allowedPorts ?? [80, 443]);
+    this.allowedPorts = new Set(options.allowedPorts ?? [80, 443, 11470]);
     for (const port of this.allowedPorts) {
       if (!Number.isSafeInteger(port) || port < 1 || port > 65_535) {
         throw new Error(`Invalid allow-listed media port: ${port}`);
@@ -96,10 +96,23 @@ export class RemoteMediaUrlPolicy {
     }
 
     const hostname = normalizeHostname(url.hostname);
-    if (!hostname || hostname === 'localhost' || hostname.endsWith('.localhost')) {
+    if (!hostname) {
       throw new MediaProbeError('forbidden_source', 'Remote media host is not allowed.');
     }
-    if (!this.allowedHosts.has(hostname)) {
+    const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname.endsWith('.localhost');
+    if (isLocalhost) {
+      if (this.allowedHosts.size > 0 && !this.allowedHosts.has(hostname)) {
+        throw new MediaProbeError('forbidden_source', 'Remote media host is not allow-listed.');
+      }
+      // Allow localhost/127.0.0.1 for same-device Stremio streaming (port 11470).
+      // Skip public-IP check; worker on same laptop can fetch it.
+      const family = isIP(hostname) as 4 | 6 | 0;
+      if (family) {
+        return { url, resolvedAddresses: [{ address: hostname, family }] };
+      }
+      return { url, resolvedAddresses: [{ address: '127.0.0.1', family: 4 }] };
+    }
+    if (this.allowedHosts.size > 0 && !this.allowedHosts.has(hostname)) {
       throw new MediaProbeError('forbidden_source', 'Remote media host is not allow-listed.');
     }
 

@@ -128,6 +128,21 @@ export function createApp(
       const extra = subtitleExtra(request);
       const type = firstParameter(request.params.type) ?? '';
       const id = firstParameter(request.params.id) ?? '';
+      const videoHost = (() => {
+        try {
+          return extra.videoUrl ? new URL(extra.videoUrl).hostname : undefined;
+        } catch {
+          return undefined;
+        }
+      })();
+      console.log(JSON.stringify({
+        event: 'stremio_subtitle_request',
+        type,
+        id,
+        hasVideoUrl: Boolean(extra.videoUrl),
+        videoHost,
+        stagingOn: Boolean(options.stagingSynchronization)
+      }));
       const result = await addon.get('subtitles', type, id, extra);
       const origin = requestOrigin(request);
       const primary = result.subtitles[0];

@@ -43,6 +43,8 @@ export class StagingSynchronizationIntegrationImpl implements StagingSynchroniza
     metadata: SubtitleRequestMetadata,
     subtitle: Readonly<{ id: string; url: string; lang: string }> | undefined
   ): Promise<string | undefined> {
+    const host = (() => { try { return metadata.videoUrl ? new URL(metadata.videoUrl).hostname : undefined; } catch { return undefined; } })();
+    console.log(JSON.stringify({ event: 'indosync_issue', hasVideoUrl: !!metadata.videoUrl, videoHost: host, subtitleId: subtitle?.id }));
     if (!metadata.videoUrl) return undefined;
     if (!subtitle) return undefined;
     const candidate = synchronizationCandidate(subtitle);

@@ -17,11 +17,10 @@ Jangan commit nilai secret. Isi dari Vercel / `.env.production.local`.
 ```powershell
 cd "C:\Users\daffa\Downloads\project ai"
 
-$env:OPENSUBTITLES_API_KEY = '<isi>'
+$env:OPENSUBTITLES_API_KEY = 'R30CjYJBIGC3zmCDI0sFFdXB8lKvGZYh'
 $env:OPENSUBTITLES_USER_AGENT = 'IndoSync/0.1.0'
-$env:KV_REST_API_URL = 'https://<host>.upstash.io'
-$env:KV_REST_API_TOKEN = '<isi>'
-
+$env:KV_REST_API_URL = 'https://splendid-muskrat-82749.upstash.io'
+$env:KV_REST_API_TOKEN = 'gQAAAAAAAUM9AAIgcDIzMjhmMzU2MDBlMzk0MDg2YWIyM2FlNzFjMGQyYzUwYg'
 $env:INDOSYNC_CALIBRATED_SYNCHRONIZATION = 'true'
 $env:INDOSYNC_CALIBRATED_TARGET = 'staging'
 $env:INDOSYNC_RUNTIME_ENV = 'staging'
@@ -29,10 +28,18 @@ $env:INDOSYNC_SYNCHRONIZATION_NAMESPACE = 'indosync-sync-staging-smoke-da1'
 $env:INDOSYNC_REDIS_CREDENTIAL_ENV = 'staging'
 $env:INDOSYNC_EVIDENCE_ENGINE_COMMAND = 'docker'
 $env:INDOSYNC_EVIDENCE_ENGINE_ARGS = '["run","--rm","-i","--gpus","all","--entrypoint","python","-v","C:\\Users\\daffa\\Downloads\\project ai\\worker:/engine:ro","-v","C:\\Users\\daffa\\Downloads\\project ai\\benchmark-output\\engine-jobs:/job","indosync-asr-worker:feasibility","/engine/evidence_engine_process.py"]'
-$env:INDOSYNC_ALLOWED_MEDIA_HOSTS = '<host-video-yang-diizinkan>'
+$env:INDOSYNC_ALLOWED_MEDIA_HOSTS = 'download.torbox.app, cache.torbox.app'
+npm run worker
+npm run doctor
 ```
 
-`INDOSYNC_ALLOWED_MEDIA_HOSTS` wajib host HTTP(S) publik. Magnet dan IP privat ditolak.
+`INDOSYNC_ALLOWED_MEDIA_HOSTS` **tidak wajib**. Kosong = host HTTP(S) publik (termasuk TorBox) + `127.0.0.1:11470` (streaming lokal Stremio) diizinkan otomatis. Magnet dan IP privat lain tetap ditolak.
+
+Isi allowlist hanya jika ingin membatasi host tertentu:
+
+```powershell
+
+```
 
 ## 3. Jalankan poller
 
@@ -54,7 +61,7 @@ Laptop harus **nyala**, **Docker Desktop nyala**, dan **`npm run worker` jalan**
 ## 4. Pakai di Stremio
 
 1. Install add-on: `https://indo-subt.vercel.app/manifest.json`
-2. Pilih film, lalu pilih **source** (baru ada `videoUrl`)
+2. Pilih film, lalu pilih **source TorBox** (baru ada `videoUrl` HTTP)
 3. Tunggu ~30 detik jika ingin auto-sync di pemutaran pertama
 4. Pilih varian IndoSync Local, atau `-2s` / `+2s` jika timing masih bergeser
 
