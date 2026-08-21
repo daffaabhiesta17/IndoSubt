@@ -36,7 +36,6 @@ describe('Phase 2A subtitle service and Stremio mapping', () => {
 
     const response = await request(app).get('/subtitles/movie/tt0133093.json');
     expect(response.status).toBe(200);
-    expect(response.body.subtitles).toHaveLength(1);
     expect(response.body.subtitles[0]).toMatchObject({
       id: 'opensubtitles-42',
       lang: 'ind'
@@ -45,6 +44,9 @@ describe('Phase 2A subtitle service and Stremio mapping', () => {
       /^http:\/\/127\.0\.0\.1:\d+\/subtitles\/provider\/42\.[A-Za-z0-9_-]+\.vtt$/
     );
     expect(response.body.subtitles[0].url).not.toContain('test-signing-secret');
+    expect(response.body.subtitles).toHaveLength(3);
+    expect(response.body.subtitles[1].url).toMatch(/\/subtitles\/shift\/-2000\//);
+    expect(response.body.subtitles[2].url).toMatch(/\/subtitles\/shift\/2000\//);
   });
 
   it('supports the Stremio runtime route without .json and with filename metadata', async () => {
@@ -58,7 +60,7 @@ describe('Phase 2A subtitle service and Stremio mapping', () => {
 
     expect(response.status).toBe(200);
     expect(response.headers['content-type']).toContain('application/json');
-    expect(response.body.subtitles).toHaveLength(1);
+    expect(response.body.subtitles).toHaveLength(3);
     expect(response.body.subtitles[0]).toMatchObject({
       id: 'opensubtitles-42',
       lang: 'ind'
@@ -205,14 +207,16 @@ describe('Phase 2A subtitle service and Stremio mapping', () => {
     expect(search).toHaveBeenCalledTimes(1);
     expect(rank.mock.calls[0][0]).toHaveLength(7);
     expect(provider.download).not.toHaveBeenCalled();
-    expect(response.body.subtitles).toHaveLength(5);
-    expect(response.body.subtitles.map((item: { id: string }) => item.id)).toEqual([
+    expect(response.body.subtitles.map((item: { id: string }) => item.id).slice(0, 5)).toEqual([
       'opensubtitles-7',
       'opensubtitles-6',
       'opensubtitles-1',
       'opensubtitles-2',
       'opensubtitles-3'
     ]);
+    expect(response.body.subtitles).toHaveLength(7);
+    expect(response.body.subtitles[5].url).toMatch(/\/subtitles\/shift\/-2000\//);
+    expect(response.body.subtitles[6].url).toMatch(/\/subtitles\/shift\/2000\//);
     expect(response.body.subtitles.every((item: { lang: string }) => item.lang === 'ind')).toBe(true);
   });
 
@@ -226,10 +230,11 @@ describe('Phase 2A subtitle service and Stremio mapping', () => {
     const app = createApp(new ProviderSubtitleService(provider, 'secret'));
 
     const response = await request(app).get('/subtitles/movie/tt0133093.json');
-    expect(response.body.subtitles.map((item: { id: string }) => item.id)).toEqual([
+    expect(response.body.subtitles.map((item: { id: string }) => item.id).slice(0, 2)).toEqual([
       'opensubtitles-2',
       'opensubtitles-1'
     ]);
+    expect(response.body.subtitles).toHaveLength(4);
   });
 
   it('keeps fixture fallback behavior with metadata present', async () => {

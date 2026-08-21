@@ -2,7 +2,6 @@
 import type { SubtitleCandidate, SubtitleRequestMetadata } from './types.js';
 import type { SynchronizationMapping } from './synchronization.js';
 import {
-  createSynchronizationTaskId,
   SynchronizationReferenceCodec,
   type SynchronizationResult,
   type SynchronizationResultStore,
@@ -10,6 +9,7 @@ import {
   type SynchronizationTaskStore,
   validateSynchronizationResult
 } from './synchronization-context.js';
+import { createCachedSynchronizationTaskId } from './synchronization-job.js';
 
 export interface SynchronizationWorkerMetrics {
   evidenceEngineDurationMs?: number;
@@ -46,7 +46,6 @@ export interface SynchronizationOrchestratorOptions {
   mappingPolicy?: SynchronizationMappingPolicy;
   taskTtlMs?: number;
   now?: () => number;
-  createTaskId?: () => string;
 }
 
 export interface CreatedSynchronizationTask {
@@ -62,7 +61,6 @@ export class SynchronizationOrchestrator {
   private readonly mappingPolicy: SynchronizationMappingPolicy;
   private readonly taskTtlMs: number;
   private readonly now: () => number;
-  private readonly createTaskId: () => string;
 
   constructor(options: SynchronizationOrchestratorOptions) {
     this.sourceResolver = options.sourceResolver;
@@ -72,7 +70,6 @@ export class SynchronizationOrchestrator {
     this.mappingPolicy = options.mappingPolicy ?? new DisabledSynchronizationMappingPolicy();
     this.taskTtlMs = positiveSafeInteger(options.taskTtlMs ?? 10 * 60_000, 'task TTL');
     this.now = options.now ?? Date.now;
-    this.createTaskId = options.createTaskId ?? createSynchronizationTaskId;
   }
 
   async createTask(
@@ -84,8 +81,16 @@ export class SynchronizationOrchestrator {
     const createdAt = this.currentTime();
     const expiresAt = createdAt + this.taskTtlMs;
     if (!Number.isSafeInteger(expiresAt)) throw new Error('Synchronization task expiry overflowed.');
+    const taskId = createCachedSynchronizationTaskId(candidate.provider, candidate.reference, source.url);
+    const existing = await this.taskStore.get(taskId);
+    if (existing && existing.expiresAt > createdAt) {
+      return {
+        task: structuredClone(existing),
+        reference: this.referenceCodec.issue({ taskId: existing.id, expiresAt: existing.expiresAt })
+      };
+    }
     const task: SynchronizationTask = {
-      id: this.createTaskId(),
+      id: taskId,
       mediaSource: structuredClone(source),
       provider: candidate.provider,
       providerReference: candidate.reference,
@@ -94,7 +99,18 @@ export class SynchronizationOrchestrator {
       createdAt,
       expiresAt
     };
-    await this.taskStore.create(task);
+    try {
+      await this.taskStore.create(task);
+    } catch {
+      const raced = await this.taskStore.get(taskId);
+      if (raced && raced.expiresAt > createdAt) {
+        return {
+          task: structuredClone(raced),
+          reference: this.referenceCodec.issue({ taskId: raced.id, expiresAt: raced.expiresAt })
+        };
+      }
+      throw new Error('Synchronization task already exists.');
+    }
     return {
       task: structuredClone(task),
       reference: this.referenceCodec.issue({ taskId: task.id, expiresAt })

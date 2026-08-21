@@ -35,3 +35,18 @@ export interface SynchronizationJobObserver {
 export const disabledSynchronizationJobObserver: SynchronizationJobObserver = {
   record: () => undefined
 };
+
+export const consoleSynchronizationJobObserver: SynchronizationJobObserver = {
+  record: (observation) => {
+    console.log(JSON.stringify({
+      event: observation.event,
+      jobId: observation.jobId,
+      attempt: observation.attempt,
+      resultState: observation.resultState,
+      failureCategory: observation.failureCategory,
+      evidenceCount: observation.evidenceCount,
+      selectedModel: observation.selectedModel,
+      residualMs: observation.residualMs
+    }));
+  }
+};

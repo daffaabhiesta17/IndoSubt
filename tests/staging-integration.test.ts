@@ -11,7 +11,7 @@ import {
   type SynchronizationResult
 } from '../src/subtitles/synchronization-context.js';
 import { SynchronizationOrchestrator } from '../src/subtitles/synchronization-orchestrator.js';
-import { createSynchronizationJob, InMemorySynchronizationJobStore } from '../src/subtitles/synchronization-job.js';
+import { createCachedSynchronizationTaskId, createSynchronizationJob, InMemorySynchronizationJobStore } from '../src/subtitles/synchronization-job.js';
 import {
   StagingSynchronizationIntegrationImpl,
   StagingSynchronizationWorkerBridge,
@@ -22,6 +22,7 @@ import { approvedMappingFromResult } from '../src/subtitles/synchronization-resu
 
 const now = 1_000_000;
 const webvtt = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHalo';
+const cachedTaskId = createCachedSynchronizationTaskId('opensubtitles', '42', 'https://media.example.com/movie.mp4');
 
 function provider(searchResult: any[] = []): SubtitleProvider {
   return {
@@ -47,7 +48,7 @@ function approvedResult(): SynchronizationResult {
   const pv = '2026-08-v1';
   const mv = 'offset-first-v1';
   return {
-    taskId: 'task_123',
+    taskId: cachedTaskId,
     points: evidence.map((e) => ({ sourceMs: e.sourceAnchorMs, referenceMs: e.referenceAnchorMs })),
     provenance: { kind: 'calibrated-model-selection', state: 'approved', policyId: pid, policyVersion: pv, modelSelectionVersion: mv },
     evidence,
@@ -100,8 +101,7 @@ function setup(withStaging: boolean, searchResult: any[] = [], workerResult?: Sy
     referenceCodec,
     mappingPolicy,
     taskTtlMs: 60_000,
-    now: () => now,
-    createTaskId: () => 'task_123'
+    now: () => now
   });
   const worker: SynchronizationWorker = {
     process: vi.fn().mockResolvedValue(workerResult ?? approvedResult())
@@ -123,8 +123,21 @@ describe('staging integration parallel IndoSync', () => {
     ]);
     const response = await request(app).get('/subtitles/movie/tt0133093.json');
     expect(response.status).toBe(200);
-    expect(response.body.subtitles).toHaveLength(1);
     expect(response.body.subtitles[0].url).toMatch(/\/subtitles\/provider\//);
+    expect(response.body.subtitles.some((item: { url: string }) => item.url.includes('/subtitles/synchronization/'))).toBe(false);
+    expect(response.body.subtitles).toHaveLength(3);
+  });
+
+  it('reuses the same synchronization reference for the same video and subtitle', async () => {
+    const { app } = setup(true, [
+      { provider: 'opensubtitles', reference: '42', language: 'id', fileName: 'movie.srt' }
+    ]);
+    const path = '/subtitles/movie/tt0133093.json?videoUrl=' + encodeURIComponent('https://media.example.com/movie.mp4');
+    const first = await request(app).get(path);
+    const second = await request(app).get(path);
+    const firstSync = first.body.subtitles.find((item: { url: string }) => item.url.includes('/subtitles/synchronization/'));
+    const secondSync = second.body.subtitles.find((item: { url: string }) => item.url.includes('/subtitles/synchronization/'));
+    expect(new URL(firstSync.url).pathname).toBe(new URL(secondSync.url).pathname);
   });
 
   it('staging ON with videoUrl emits a parallel synchronization reference', async () => {
@@ -135,10 +148,10 @@ describe('staging integration parallel IndoSync', () => {
       '/subtitles/movie/tt0133093.json?videoUrl=' + encodeURIComponent('https://media.example.com/movie.mp4')
     );
     expect(response.status).toBe(200);
-    expect(response.body.subtitles).toHaveLength(2);
     expect(response.body.subtitles[0].url).toMatch(/\/subtitles\/provider\//);
-    expect(response.body.subtitles[1].url).toMatch(/\/subtitles\/synchronization\//);
-    const task = (await taskStore.get('task_123'))!;
+    expect(response.body.subtitles.some((item: { url: string }) => item.url.includes('/subtitles/synchronization/'))).toBe(true);
+    expect(response.body.subtitles).toHaveLength(4);
+    const task = (await taskStore.get(cachedTaskId))!;
     expect(task).toBeDefined();
     expect(await jobStore.get(createSynchronizationJob(task, now, 3).id)).not.toBeNull();
   });
@@ -149,8 +162,9 @@ describe('staging integration parallel IndoSync', () => {
     ]);
     const response = await request(app).get('/subtitles/movie/tt0133093.json');
     expect(response.status).toBe(200);
-    expect(response.body.subtitles).toHaveLength(1);
     expect(response.body.subtitles[0].url).toMatch(/\/subtitles\/provider\//);
+    expect(response.body.subtitles.some((item: { url: string }) => item.url.includes('/subtitles/synchronization/'))).toBe(false);
+    expect(response.body.subtitles).toHaveLength(3);
   });
 
   it('issuance / Redis failure leaves original subtitles intact', async () => {
@@ -164,8 +178,9 @@ describe('staging integration parallel IndoSync', () => {
       '/subtitles/movie/tt0133093.json?videoUrl=' + encodeURIComponent('https://media.example.com/movie.mp4')
     );
     expect(response.status).toBe(200);
-    expect(response.body.subtitles).toHaveLength(1);
     expect(response.body.subtitles[0].url).toMatch(/\/subtitles\/provider\//);
+    expect(response.body.subtitles.some((item: { url: string }) => item.url.includes('/subtitles/synchronization/'))).toBe(false);
+    expect(response.body.subtitles).toHaveLength(3);
   });
 
   it('approved result applies mapping and keeps original provider intact', async () => {
@@ -211,7 +226,7 @@ describe('staging integration parallel IndoSync', () => {
     expect(response.text).toBe(webvtt);
   });
 
-  it('pending result falls back to original / 404', async () => {
+  it('pending result serves original VTT (Opsi A fallback)', async () => {
     const { app, orchestrator } = setup(true, [
       { provider: 'opensubtitles', reference: '42', language: 'id', fileName: 'movie.srt' }
     ]);
@@ -222,7 +237,8 @@ describe('staging integration parallel IndoSync', () => {
     const pending = await request(app).get(
       `/subtitles/synchronization/${encodeURIComponent(task.reference)}.vtt`
     );
-    expect(pending.status).toBe(404);
+    expect(pending.status).toBe(200);
+    expect(pending.text).toBe(webvtt);
   });
 
   it('worker failure produces no result and original flow stays safe', async () => {
@@ -238,11 +254,11 @@ describe('staging integration parallel IndoSync', () => {
     };
     const orchestrator = new SynchronizationOrchestrator({
       sourceResolver, taskStore: new InMemorySynchronizationTaskStore(), resultStore: new InMemorySynchronizationResultStore(),
-      referenceCodec, mappingPolicy: { select: () => undefined }, taskTtlMs: 60_000, now: () => now, createTaskId: () => 'task_123'
+      referenceCodec, mappingPolicy: { select: () => undefined }, taskTtlMs: 60_000, now: () => now
     });
     const bridge = new StagingSynchronizationWorkerBridge(failingWorker, orchestrator, taskStore, referenceCodec, () => now);
     await expect(bridge.process(
-      { id: 'task_123', mediaSource: { kind: 'remote-url', url: 'https://media.example.com/movie.mp4' }, provider: 'opensubtitles', providerReference: '42', language: 'id', status: 'processing', createdAt: now - 1, expiresAt: now + 60_000 },
+      { id: cachedTaskId, mediaSource: { kind: 'remote-url', url: 'https://media.example.com/movie.mp4' }, provider: 'opensubtitles', providerReference: '42', language: 'id', status: 'processing', createdAt: now - 1, expiresAt: now + 60_000 },
       {}
     )).rejects.toThrow('worker crashed');
     expect(jobStore).toBeDefined();
@@ -256,7 +272,23 @@ describe('staging integration parallel IndoSync', () => {
       '/subtitles/movie/tt0133093.json?videoUrl=' + encodeURIComponent('https://media.example.com/movie.mp4')
     );
     expect(response.status).toBe(200);
-    expect(response.body.subtitles).toHaveLength(1);
     expect(response.body.subtitles[0].url).toMatch(/\/subtitles\/provider\//);
+    expect(response.body.subtitles.some((item: { url: string }) => item.url.includes('/subtitles/synchronization/'))).toBe(false);
+    expect(response.body.subtitles).toHaveLength(3);
+  });
+
+  it('serves manual -2s and +2s shifts from the original OpenSubtitles variant', async () => {
+    const { app } = setup(false, [
+      { provider: 'opensubtitles', reference: '42', language: 'id', fileName: 'movie.srt' }
+    ]);
+    const listed = await request(app).get('/subtitles/movie/tt0133093.json');
+    const minus = listed.body.subtitles.find((item: { url: string }) => item.url.includes('/shift/-2000/'));
+    const plus = listed.body.subtitles.find((item: { url: string }) => item.url.includes('/shift/2000/'));
+    const minusResponse = await request(app).get(new URL(minus.url).pathname);
+    const plusResponse = await request(app).get(new URL(plus.url).pathname);
+    expect(minusResponse.status).toBe(200);
+    expect(plusResponse.status).toBe(200);
+    expect(minusResponse.text).toMatch(/^WEBVTT/);
+    expect(plusResponse.text).toContain('00:00:03.000 --> 00:00:04.000');
   });
 });

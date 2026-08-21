@@ -46,6 +46,11 @@ for (const [network, prefix] of [
   nonPublicIpv6.addSubnet(network, prefix, 'ipv6');
 }
 
+export function parseAllowedMediaHosts(value: string | undefined): string[] {
+  if (!value?.trim()) return [];
+  return value.split(',').map((host) => host.trim()).filter(Boolean);
+}
+
 export class RemoteMediaUrlPolicy {
   private readonly allowedHosts: ReadonlySet<string>;
   private readonly allowedPorts: ReadonlySet<number>;
@@ -72,6 +77,9 @@ export class RemoteMediaUrlPolicy {
       throw new MediaProbeError('invalid_source', 'Remote media URL is malformed.');
     }
 
+    if (url.protocol === 'magnet:') {
+      throw new MediaProbeError('forbidden_source', 'Remote media URL must not use magnet links.');
+    }
     if (url.protocol !== 'http:' && url.protocol !== 'https:') {
       throw new MediaProbeError('invalid_source', 'Remote media URL must use HTTP or HTTPS.');
     }

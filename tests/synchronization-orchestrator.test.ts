@@ -10,9 +10,11 @@ import {
   type SynchronizationMappingPolicy,
   type SynchronizationWorker
 } from '../src/subtitles/synchronization-orchestrator.js';
+import { createCachedSynchronizationTaskId } from '../src/subtitles/synchronization-job.js';
 
 const now = 1_000_000;
 const source = { kind: 'remote-url', url: 'https://media.example.com/movie.mp4' } as const;
+const cachedTaskId = createCachedSynchronizationTaskId('opensubtitles', '42', source.url);
 const metadata = { videoUrl: source.url };
 const candidate = {
   provider: 'opensubtitles',
@@ -23,7 +25,7 @@ const candidate = {
 
 function result(overrides: Partial<SynchronizationResult> = {}): SynchronizationResult {
   return {
-    taskId: 'task_123',
+    taskId: cachedTaskId,
     points: [
       { sourceMs: 1_000, referenceMs: 2_000 },
       { sourceMs: 5_000, referenceMs: 6_000 }
@@ -49,8 +51,7 @@ function setup(options: { purpose?: string; mappingPolicy?: SynchronizationMappi
     referenceCodec: codec,
     mappingPolicy: options.mappingPolicy,
     taskTtlMs: 60_000,
-    now: () => now,
-    createTaskId: () => 'task_123'
+    now: () => now
   });
   return { orchestrator, taskStore, resultStore, codec, sourceResolver };
 }
@@ -62,7 +63,7 @@ describe('opt-in synchronization orchestration lifecycle', () => {
     await expect(context.orchestrator.createTask({}, candidate)).rejects.toThrow(
       'requires a trusted media source'
     );
-    expect(await context.taskStore.get('task_123')).toBeNull();
+     expect(await context.taskStore.get(cachedTaskId)).toBeNull();
   });
 
   it('propagates source policy rejection before storing a task', async () => {
@@ -73,14 +74,22 @@ describe('opt-in synchronization orchestration lifecycle', () => {
     await expect(context.orchestrator.createTask(metadata, candidate)).rejects.toMatchObject({
       code: 'forbidden_source'
     });
-    expect(await context.taskStore.get('task_123')).toBeNull();
+     expect(await context.taskStore.get(cachedTaskId)).toBeNull();
+  });
+
+  it('reuses the same cached task for the same video and subtitle pair', async () => {
+    const { orchestrator } = setup();
+    const first = await orchestrator.createTask(metadata, candidate);
+    const second = await orchestrator.createTask(metadata, candidate);
+    expect(second.task.id).toBe(first.task.id);
+    expect(second.reference).toBe(first.reference);
   });
 
   it('creates an opaque task reference without embedding media or provider data', async () => {
     const { orchestrator } = setup();
     const created = await orchestrator.createTask(metadata, candidate);
     expect(created.task).toMatchObject({
-      id: 'task_123',
+      id: cachedTaskId,
       mediaSource: source,
       provider: 'opensubtitles',
       providerReference: '42',
@@ -96,7 +105,7 @@ describe('opt-in synchronization orchestration lifecycle', () => {
     const { reference } = await orchestrator.createTask(metadata, candidate);
     const worker: SynchronizationWorker = { process: vi.fn().mockResolvedValue(result()) };
     await expect(orchestrator.process(reference, worker)).resolves.toEqual(result());
-    expect(worker.process).toHaveBeenCalledWith(expect.objectContaining({ id: 'task_123' }));
+    expect(worker.process).toHaveBeenCalledWith(expect.objectContaining({ id: cachedTaskId }));
     await expect(orchestrator.getResult(reference)).resolves.toEqual(result());
     await expect(orchestrator.getTask(reference)).resolves.toMatchObject({ status: 'completed' });
   });
@@ -121,14 +130,14 @@ describe('opt-in synchronization orchestration lifecycle', () => {
   it('rejects tampered, expired, wrong-purpose, and unknown references', async () => {
     const { orchestrator } = setup();
     const { reference } = await orchestrator.createTask(metadata, candidate);
-    await expect(orchestrator.getTask(reference.replace('task_123', 'task_999'))).rejects.toThrow();
+    await expect(orchestrator.getTask(reference.replace(cachedTaskId, 'task_999'))).rejects.toThrow();
 
     const expiredCodec = new SynchronizationReferenceCodec('test-secret', 'subtitle-vtt');
-    const expired = expiredCodec.issue({ taskId: 'task_123', expiresAt: now });
+    const expired = expiredCodec.issue({ taskId: cachedTaskId, expiresAt: now });
     await expect(orchestrator.getTask(expired)).rejects.toThrow('expired');
 
     const wrongPurpose = new SynchronizationReferenceCodec('test-secret', 'worker').issue({
-      taskId: 'task_123',
+      taskId: cachedTaskId,
       expiresAt: now + 60_000
     });
     await expect(orchestrator.getTask(wrongPurpose)).rejects.toThrow('purpose');

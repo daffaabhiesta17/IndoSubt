@@ -28,12 +28,13 @@ export class OrchestratedSynchronizationSubtitleDelivery
     } catch {
       throw new ProviderError('not_found', 'Invalid synchronization reference.');
     }
-    if (!task || task.status !== 'completed' || task.provider !== this.provider.name) {
+    if (!task || task.provider !== this.provider.name) {
       throw new ProviderError('not_found', 'Synchronization task was not found.');
     }
 
     const subtitle = await this.provider.download(task.providerReference);
     if (!subtitle.contentType.toLowerCase().startsWith('text/vtt')) return subtitle;
+    if (task.status !== 'completed') return subtitle;
 
     const mapping = await this.orchestrator.getMapping(reference);
     if (!mapping) return subtitle;

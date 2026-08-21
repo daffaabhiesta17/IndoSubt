@@ -1,0 +1,8 @@
+faster-whisper==1.2.1
+ctranslate2==4.8.1
+silero-vad==6.2.1
+sentence-transformers==5.1.0
+transformers==4.55.4
+huggingface-hub==0.34.4
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128

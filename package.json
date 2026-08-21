@@ -9,6 +9,7 @@
   },
   "scripts": {
     "dev": "tsx src/server.ts",
+    "worker": "tsx src/worker-poller.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "build": "npm run typecheck && npm run test",

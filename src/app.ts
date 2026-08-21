@@ -11,6 +11,7 @@ import {
 } from './subtitles/service.js';
 import type { SynchronizationSubtitleDelivery } from './subtitles/synchronization-delivery.js';
 import type { StagingSynchronizationIntegration } from './subtitles/staging-integration.js';
+import { transformWebVtt } from './subtitles/webvtt.js';
 
 const currentDirectory = path.dirname(fileURLToPath(import.meta.url));
 const publicDirectory = path.resolve(currentDirectory, '../public');
@@ -128,6 +129,25 @@ export function createApp(
       const type = firstParameter(request.params.type) ?? '';
       const id = firstParameter(request.params.id) ?? '';
       const result = await addon.get('subtitles', type, id, extra);
+      const origin = requestOrigin(request);
+      const primary = result.subtitles[0];
+      const providerMatch = primary
+        ? /\/subtitles\/provider\/(.+)\.vtt$/.exec(new URL(primary.url).pathname)
+        : undefined;
+      if (primary && providerMatch) {
+        result.subtitles.push(
+          {
+            id: `${primary.id}-shift-minus-2000`,
+            url: `${origin}/subtitles/shift/-2000/${providerMatch[1]}.vtt`,
+            lang: 'ind'
+          },
+          {
+            id: `${primary.id}-shift-plus-2000`,
+            url: `${origin}/subtitles/shift/2000/${providerMatch[1]}.vtt`,
+            lang: 'ind'
+          }
+        );
+      }
       if (options.stagingSynchronization) {
         // IndoSync is an additive, asynchronous parallel subtitle reference.
         // Issuance is a fast Upstash write only; the GPU evidence engine runs
@@ -144,7 +164,7 @@ export function createApp(
         if (reference) {
           result.subtitles.push({
             id: `indosync-sync-${reference}`,
-            url: `${requestOrigin(request)}/subtitles/synchronization/${encodeURIComponent(reference)}.vtt`,
+            url: `${origin}/subtitles/synchronization/${encodeURIComponent(reference)}.vtt`,
             lang: 'ind'
           });
         }
@@ -172,6 +192,20 @@ export function createApp(
     try {
       const subtitle = await subtitleService.download(request.params.reference);
       response.type(subtitle.contentType).send(subtitle.content);
+    } catch (error) {
+      sendSubtitleError(response, error);
+    }
+  });
+
+  app.get('/subtitles/shift/:offsetMs/:reference.vtt', async (request, response) => {
+    try {
+      const offsetMs = Number(request.params.offsetMs);
+      if (!Number.isSafeInteger(offsetMs) || Math.abs(offsetMs) > 10_000) {
+        response.status(400).json({ error: 'Invalid subtitle shift.' });
+        return;
+      }
+      const subtitle = await subtitleService.download(request.params.reference);
+      response.type(subtitle.contentType).send(transformWebVtt(subtitle.content, { offsetMs }));
     } catch (error) {
       sendSubtitleError(response, error);
     }

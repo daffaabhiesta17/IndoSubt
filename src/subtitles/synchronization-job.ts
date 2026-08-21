@@ -50,7 +50,11 @@ export function createSynchronizationJob(task: SynchronizationTask, now: number,
   return { id, correlationId: id, task: structuredClone(task), state:'queued', attempt:0, maxAttempts, nextAttemptAt:now, createdAt:now, updatedAt:now, expiresAt:task.expiresAt };
 }
 export function createSynchronizationJobId(task: SynchronizationTask): string {
-  return createHash('sha256').update(task.id).update('\0').update(task.provider).update('\0').update(task.providerReference).update('\0').update(task.mediaSource.url).digest('base64url').slice(0,36);
+  return createHash('sha256').update(task.provider).update('\0').update(task.providerReference).update('\0').update(task.mediaSource.url).digest('base64url').slice(0,36);
+}
+
+export function createCachedSynchronizationTaskId(provider: string, providerReference: string, mediaUrl: string): string {
+  return createHash('sha256').update(provider).update('\0').update(providerReference).update('\0').update(mediaUrl).digest('base64url').slice(0, 24);
 }
 export async function enqueueSynchronizationJob(
   store: SynchronizationJobStore,

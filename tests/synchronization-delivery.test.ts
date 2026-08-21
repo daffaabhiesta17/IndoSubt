@@ -15,9 +15,11 @@ import {
   SynchronizationOrchestrator,
   type SynchronizationMappingPolicy
 } from '../src/subtitles/synchronization-orchestrator.js';
+import { createCachedSynchronizationTaskId } from '../src/subtitles/synchronization-job.js';
 
 const now = 1_000_000;
 const webvtt = 'WEBVTT\n\n00:00:01.000 --> 00:00:02.000\nHalo';
+const cachedTaskId = createCachedSynchronizationTaskId('opensubtitles', '42', 'https://media.example.com/movie.mp4');
 
 function provider(): SubtitleProvider {
   return {
@@ -32,7 +34,7 @@ function provider(): SubtitleProvider {
 
 function result(overrides: Partial<SynchronizationResult> = {}): SynchronizationResult {
   return {
-    taskId: 'task_123',
+    taskId: cachedTaskId,
     points: [
       { sourceMs: 1_000, referenceMs: 2_000 },
       { sourceMs: 5_000, referenceMs: 6_000 }
@@ -66,8 +68,7 @@ function setup(mappingEnabled: boolean) {
     referenceCodec: new SynchronizationReferenceCodec('test-secret', 'subtitle-vtt'),
     mappingPolicy,
     taskTtlMs: 60_000,
-    now: () => now,
-    createTaskId: () => 'task_123'
+    now: () => now
   });
   const delivery = new OrchestratedSynchronizationSubtitleDelivery(
     subtitleProvider,
@@ -116,14 +117,15 @@ describe('opt-in synchronization subtitle delivery', () => {
     expect(response.text).toBe(webvtt);
   });
 
-  it('rejects a pending task and returns identity content with disabled mapping policy', async () => {
+  it('serves original subtitle for a pending task (Opsi A fallback)', async () => {
     const context = setup(false);
     const reference = await taskReference(context.orchestrator);
     const pending = await request(context.app).get(
       `/subtitles/synchronization/${encodeURIComponent(reference)}.vtt`
     );
-    expect(pending.status).toBe(404);
-    expect(context.subtitleProvider.download).not.toHaveBeenCalled();
+    expect(pending.status).toBe(200);
+    expect(pending.text).toBe(webvtt);
+    expect(context.subtitleProvider.download).toHaveBeenCalledWith('42');
 
     await context.orchestrator.completeTask(reference, result());
     const completed = await request(context.app).get(
@@ -152,10 +154,10 @@ describe('opt-in synchronization subtitle delivery', () => {
       const valid = await taskReference(context.orchestrator);
       const reference =
         kind === 'tampered'
-          ? valid.replace('task_123', 'task_999')
+          ? valid.replace(cachedTaskId, 'task_999')
           : kind === 'wrong-purpose'
             ? new SynchronizationReferenceCodec('test-secret', 'worker').issue({
-                taskId: 'task_123',
+    taskId: cachedTaskId,
                 expiresAt: now + 60_000
               })
             : new SynchronizationReferenceCodec('test-secret', 'subtitle-vtt').issue({

@@ -91,9 +91,8 @@ async function downloadThroughHttp(
 
   expect(searchResponse.status).toBe(200);
 
-  expect(
-    searchResponse.body.subtitles
-  ).toHaveLength(1);
+  expect(searchResponse.body.subtitles[0].url).toMatch(/\/subtitles\/provider\//);
+  expect(searchResponse.body.subtitles.length).toBeGreaterThanOrEqual(1);
 
   const subtitleUrl = new URL(
     searchResponse.body.subtitles[0].url

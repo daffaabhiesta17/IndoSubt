@@ -2,6 +2,7 @@
 import { MediaProbeError } from '../src/media/types.js';
 import {
   isPublicIpAddress,
+  parseAllowedMediaHosts,
   RemoteMediaUrlPolicy,
   type HostResolver
 } from '../src/media/url-policy.js';
@@ -37,6 +38,20 @@ describe('remote media URL policy', () => {
       await expect(policy().validate(url)).rejects.toMatchObject({ code: 'invalid_source' });
     }
   );
+
+  it('rejects magnet links as forbidden sources', async () => {
+    await expect(
+      policy().validate('magnet:?xt=urn:btih:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa')
+    ).rejects.toMatchObject({ code: 'forbidden_source' });
+  });
+
+  it('parses comma-separated media host allow-lists', () => {
+    expect(parseAllowedMediaHosts(' media.example.com, cdn.example.com ')).toEqual([
+      'media.example.com',
+      'cdn.example.com'
+    ]);
+    expect(parseAllowedMediaHosts('')).toEqual([]);
+  });
 
   it('rejects malformed URLs', async () => {
     await expect(policy().validate('not a URL')).rejects.toMatchObject({ code: 'invalid_source' });
